@@ -1,1 +1,0 @@
-## 1) `arc_router`：返回“候选集合”的 Router（prefix trie + for_each_candidate）

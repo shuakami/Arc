@@ -1,9 +1,0 @@
-[check1] B receives A gossip membership
-b_sees_a_alive=1
-[check2] config sync via gossip only (http_push fallback disabled)
-cluster_config_resp={"ok":true,"generation":12116955670123826703,"scope":"gossip"}
-scope=gossip new_gen=12116955670123826703 a_before=8908489448229938915 b_before=8908489448229938915
-b_synced_to_new_gen=1
-[check3] A down -> B detects offline
-b_detected_a_offline=1
-ALL_GOSSIP_CHECKS_PASSED

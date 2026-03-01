@@ -1,1 +1,0 @@
-## 3.6 `worker.rs` 底部新增 helper：strip_query / header_value / host match / query match

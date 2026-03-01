@@ -1,4 +1,0 @@
-rewrite_resp=u1 path=/real/abc x-route=p1\n
-split_counts u1=91 u2=29
-retry_resp=u1 path=/retry3 x-route=\n code=200
-P1_SMOKE_OK

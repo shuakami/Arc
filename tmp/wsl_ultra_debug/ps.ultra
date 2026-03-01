@@ -1,1 +1,0 @@
-382 /mnt/c/Users/Shuakami_Projects/CommunityProject/Arc/target-ultra-wsl/release/ultra_gateway --listen 127.0.0.1:8083 --upstream 127.0.0.1:3000 --workers 2 --buf-count 1024
