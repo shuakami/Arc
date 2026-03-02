@@ -1,0 +1,878 @@
+openapi: 3.1.0
+info:
+  title: Arc 网关控制面 API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    Arc Gateway 控制面 HTTP 端点的 OpenAPI 定义，接口实现位于 `crates/arc-gateway/src/control.rs`。
+
+    鉴权行为：
+    - 如果设置了 `control_plane.auth_token`，请求需要携带 `Authorization: Bearer <token>`。
+    - 如果未设置 `control_plane.auth_token`，仅允许本机回环地址访问。
+servers:
+  - url: http://127.0.0.1:22100
+tags:
+  - name: status
+    description: 节点状态与代际相关端点。
+  - name: config
+    description: 配置获取、长轮询、校验与本地应用端点。
+  - name: cluster
+    description: 集群级配置推送与熔断快照端点。
+  - name: gossip
+    description: Gossip 成员、统计与生命周期端点。
+  - name: xdp
+    description: XDP 状态与映射管理端点。
+security:
+  - bearerAuth: []
+  - {}
+paths:
+  /v1/status:
+    get:
+      tags: [status]
+      operationId: getNodeStatus
+      summary: 获取当前节点状态
+      responses:
+        '200':
+          description: 当前代际与节点角色
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/config:
+    get:
+      tags: [config]
+      operationId: getCurrentConfig
+      summary: 获取当前生效配置 JSON
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          description: 带引号的代际 ETag，例如 `"123"`。
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 规范化后的原始配置 JSON
+          headers:
+            ETag:
+              description: 带引号的代际值。
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArcConfigDocument'
+        '304':
+          description: 配置未变化
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [config]
+      operationId: applyLocalConfig
+      summary: 在当前节点编译并应用配置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArcConfigDocument'
+      responses:
+        '200':
+          description: 已在本地应用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalConfigApplyResponse'
+        '409':
+          description: 配置有效，但部分字段变更需要重启
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestartRequiredResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/config/longpoll:
+    get:
+      tags: [config]
+      operationId: longPollConfig
+      summary: 等待配置代际变化
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: 最近一次已知代际。
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: timeout_ms
+          in: query
+          required: false
+          description: 等待超时时间（毫秒）。
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            maximum: 120000
+        - name: If-None-Match
+          in: header
+          required: false
+          description: 传递 `since` 的另一种方式。
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 配置已变化，返回新配置
+          headers:
+            ETag:
+              description: 带引号的代际值。
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArcConfigDocument'
+        '304':
+          description: 等待超时且配置未变化
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/config/validate:
+    post:
+      tags: [config]
+      operationId: validateConfig
+      summary: 仅编译校验配置，不应用
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArcConfigDocument'
+      responses:
+        '200':
+          description: 配置有效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigValidateResponse'
+        '409':
+          description: 配置有效，但部分字段变更需要重启
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestartRequiredResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/config:
+    post:
+      tags: [cluster]
+      operationId: pushClusterConfig
+      summary: 由 Leader 向集群节点推送配置
+      description: |
+        两阶段推送：先由对端校验，再统一提交。仅节点角色为 `leader` 时允许调用。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArcConfigDocument'
+      responses:
+        '200':
+          description: 推送已接受
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterConfigPushResponse'
+        '400':
+          description: 用于本地编译的配置 JSON 无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: 在非 Leader 节点调用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 变更涉及需重启生效的配置字段
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestartRequiredResponse'
+        '503':
+          description: 法定人数失败或部分提交失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterConfigPushResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/circuit/local:
+    get:
+      tags: [cluster]
+      operationId: getLocalCircuitSnapshot
+      summary: 获取本地熔断快照
+      responses:
+        '200':
+          description: 本地熔断快照
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeCircuitSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/members:
+    get:
+      tags: [gossip]
+      operationId: getClusterMembers
+      summary: 列出 Gossip 集群成员
+      responses:
+        '200':
+          description: 成员列表
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GossipMemberView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Gossip 未启用或未运行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/gossip/stats:
+    get:
+      tags: [gossip]
+      operationId: getGossipStats
+      summary: 获取 Gossip 运行统计
+      responses:
+        '200':
+          description: Gossip 统计信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GossipStatsView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Gossip 未启用或未运行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/gossip/join:
+    post:
+      tags: [gossip]
+      operationId: joinGossipPeer
+      summary: 将节点加入 Gossip 集群
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GossipJoinRequest'
+      responses:
+        '200':
+          description: 已加入
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleOkResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Gossip 未启用或未运行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/gossip/leave:
+    post:
+      tags: [gossip]
+      operationId: leaveGossipCluster
+      summary: 离开 Gossip 集群
+      responses:
+        '200':
+          description: 已离开集群
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleOkResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Gossip 未启用或未运行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/xdp/status:
+    get:
+      tags: [xdp]
+      operationId: getXdpStatus
+      summary: 获取 XDP 运行状态
+      responses:
+        '200':
+          description: XDP 状态
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpStatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP 管理器未初始化
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/xdp/blacklist:
+    get:
+      tags: [xdp]
+      operationId: listXdpBlacklist
+      summary: 列出黑名单 IP/CIDR 条目
+      parameters:
+        - name: max
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 65536
+            default: 1024
+      responses:
+        '200':
+          description: 黑名单条目
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpBlacklistListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP 管理器未初始化
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [xdp]
+      operationId: addXdpBlacklistEntry
+      summary: 新增黑名单条目
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XdpBlacklistAddRequest'
+      responses:
+        '200':
+          description: 条目已添加
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpBlacklistMutationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP 管理器未初始化
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [xdp]
+      operationId: removeXdpBlacklistEntry
+      summary: 移除黑名单条目
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XdpIpRequest'
+      responses:
+        '200':
+          description: 条目已移除或不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpRemoveResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP 管理器未初始化
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/xdp/whitelist:
+    get:
+      tags: [xdp]
+      operationId: listXdpWhitelist
+      summary: 列出白名单 IP/CIDR 条目
+      parameters:
+        - name: max
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 65536
+            default: 1024
+      responses:
+        '200':
+          description: 白名单条目
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpWhitelistListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP 管理器未初始化
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [xdp]
+      operationId: addXdpWhitelistEntry
+      summary: 新增白名单条目
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XdpIpRequest'
+      responses:
+        '200':
+          description: 条目已添加
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpSimpleIpResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP 管理器未初始化
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [xdp]
+      operationId: removeXdpWhitelistEntry
+      summary: 移除白名单条目
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XdpIpRequest'
+      responses:
+        '200':
+          description: 条目已移除或不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpRemoveResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP 管理器未初始化
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+
+  responses:
+    Unauthorized:
+      description: 未授权
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: unauthorized
+    InternalError:
+      description: 内部错误
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ArcConfigDocument:
+      type: object
+      description: 原始 Arc 配置 JSON 文档。
+      additionalProperties: true
+
+    StatusResponse:
+      type: object
+      required: [generation, node_id, role]
+      properties:
+        generation:
+          type: integer
+          format: int64
+        node_id:
+          type: string
+        role:
+          type: string
+          enum: [standalone, leader, follower]
+
+    ConfigValidateResponse:
+      type: object
+      required: [ok, generation]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        generation:
+          type: integer
+          format: int64
+
+    LocalConfigApplyResponse:
+      type: object
+      required: [generation, scope]
+      properties:
+        generation:
+          type: integer
+          format: int64
+        scope:
+          type: string
+          enum: [local]
+
+    RestartRequiredResponse:
+      type: object
+      required: [ok, status, generation, changed_params, message]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        status:
+          type: string
+          const: restart_required
+        generation:
+          type: integer
+          format: int64
+        changed_params:
+          type: array
+          items:
+            type: string
+        message:
+          type: string
+
+    ClusterConfigPushResponse:
+      type: object
+      required: [ok, generation]
+      properties:
+        ok:
+          type: boolean
+        generation:
+          type: integer
+          format: int64
+        validated:
+          type: integer
+          format: int32
+        committed:
+          type: integer
+          format: int32
+        quorum:
+          type: integer
+          format: int32
+        scope:
+          type: string
+          enum: [http_push, gossip]
+        reason:
+          type: string
+
+    NodeCircuitSnapshot:
+      type: object
+      required: [node_id, ts_ms, open_until_ms]
+      properties:
+        node_id:
+          type: string
+        ts_ms:
+          type: integer
+          format: int64
+        open_until_ms:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+
+    GossipMemberView:
+      type: object
+      required: [id, address, status, config_version, last_seen_ms]
+      properties:
+        id:
+          type: string
+        address:
+          type: string
+        status:
+          type: string
+        config_version:
+          type: integer
+          format: int64
+        last_seen_ms:
+          type: integer
+          format: int64
+
+    GossipStatsView:
+      type: object
+      required:
+        [messages_sent, messages_received, convergence_time_ms_p99, members_alive, members_suspect, members_dead]
+      properties:
+        messages_sent:
+          type: integer
+          format: int64
+        messages_received:
+          type: integer
+          format: int64
+        convergence_time_ms_p99:
+          type: integer
+          format: int64
+        members_alive:
+          type: integer
+          format: int32
+        members_suspect:
+          type: integer
+          format: int32
+        members_dead:
+          type: integer
+          format: int32
+
+    GossipJoinRequest:
+      type: object
+      required: [peer]
+      additionalProperties: false
+      properties:
+        peer:
+          type: string
+          description: 用于加入集群的对端地址。
+
+    SimpleOkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    XdpStatusResponse:
+      type: object
+      required:
+        [mode, interface, pin_base, kernel_release, program_version, blacklist_capacity, whitelist_capacity]
+      properties:
+        mode:
+          type: string
+        interface:
+          type: string
+        pin_base:
+          type: string
+        kernel_release:
+          type: string
+        program_version:
+          type: string
+        blacklist_capacity:
+          type: integer
+          format: int32
+        whitelist_capacity:
+          type: integer
+          format: int32
+
+    XdpBlacklistAddRequest:
+      type: object
+      required: [ip]
+      additionalProperties: false
+      properties:
+        ip:
+          type: string
+          description: IP 或 CIDR 文本（例如 `203.0.113.7/32`）。
+        ttl_ms:
+          type: integer
+          format: int64
+          minimum: 1
+        reason:
+          type: string
+
+    XdpIpRequest:
+      type: object
+      required: [ip]
+      additionalProperties: false
+      properties:
+        ip:
+          type: string
+          description: IP 或 CIDR 文本。
+
+    XdpBlacklistListResponse:
+      type: object
+      required: [count, items]
+      properties:
+        count:
+          type: integer
+          format: int32
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/XdpBlacklistItem'
+
+    XdpBlacklistItem:
+      type: object
+      required: [ip, prefix_len, reason, blocked_at_ns, ttl_ms, remaining_ms]
+      properties:
+        ip:
+          type: string
+        prefix_len:
+          type: integer
+          format: int32
+        reason:
+          type: string
+        blocked_at_ns:
+          type: integer
+          format: int64
+        ttl_ms:
+          type: integer
+          format: int64
+        remaining_ms:
+          type: [integer, 'null']
+          format: int64
+
+    XdpBlacklistMutationResponse:
+      type: object
+      required: [ok, ip, ttl_ms, reason]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        ip:
+          type: string
+        ttl_ms:
+          type: integer
+          format: int64
+        reason:
+          type: string
+
+    XdpWhitelistListResponse:
+      type: object
+      required: [count, items]
+      properties:
+        count:
+          type: integer
+          format: int32
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/XdpWhitelistItem'
+
+    XdpWhitelistItem:
+      type: object
+      required: [ip, prefix_len]
+      properties:
+        ip:
+          type: string
+        prefix_len:
+          type: integer
+          format: int32
+
+    XdpSimpleIpResponse:
+      type: object
+      required: [ok, ip]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        ip:
+          type: string
+
+    XdpRemoveResponse:
+      type: object
+      required: [ok, removed, ip]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        removed:
+          type: boolean
+        ip:
+          type: string
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+
+

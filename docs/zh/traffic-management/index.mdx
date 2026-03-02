@@ -1,0 +1,314 @@
+---
+title: "流量管理"
+description: "本页说明 Arc 的路由、流量镜像、流量分流和插件系统。"
+---
+
+---
+
+## 路由
+
+Arc 使用两层路由架构：
+
+- **快速路径**：无分配 radix 树（`arc-router`）在热路径把原始 URL 映射到 route ID。
+- **完整匹配**：多维路由器（`arc-core`）进一步按 host、method、header、cookie、query 条件决策最终路由。
+
+### 路径模式
+
+| 模式 | 示例 | 行为 |
+|---|---|---|
+| 精确字面量 | `/api/v1/health` | 仅命中完全相同路径 |
+| 捕获段 | `/users/{id}/profile` | 捕获 `id` 段 |
+| 尾部捕获 | `/{*rest}` | 捕获剩余全部路径 |
+| 单段通配 | `/static/*` | 匹配任意单段，不跨 `/` |
+| 深通配 | `/api/**` | 最后一个段进行深匹配 |
+
+匹配前会去掉 query string 和 fragment。路由匹配复杂度 O(log n)，且不需要加锁。
+
+### 匹配谓词
+
+除路径外，还可以按以下维度匹配：
+
+```yaml
+routes:
+  - name: mobile-api
+    match:
+      host: [api.example.com]
+      methods: [GET, POST]
+      path: /v2/{*rest}
+      headers:
+        - op: equals
+          name: X-Client-Type
+          value: mobile
+      cookies:
+        - op: equals
+          name: session_tier
+          value: premium
+      query:
+        - op: exists
+          name: debug
+```
+
+路由上的谓词是“全部满足”关系。命中顺序上，第一个匹配成功的路由会生效。
+
+### 路由优先级
+
+优先级规则如下：
+1. 精确路径优先于通配路径
+2. 长路径优先于短路径
+3. 更具体的段匹配优先于深通配
+4. 同一优先级下，按声明顺序决定
+
+### 请求重写
+
+在转发前重写 URL：
+
+```yaml
+action:
+  upstream: api
+  rewrite:
+    pattern: "^/legacy/(.+)$"
+    replace: "/api/v2/$1"
+```
+
+### Header 变更
+
+转发到上游前可增加、覆盖或移除 Header：
+
+```yaml
+action:
+  upstream: api
+  headers:
+    - op: set
+      name: X-Forwarded-By
+      value: arc
+    - op: add
+      name: X-Request-Id
+      value: "{request_id}"
+    - op: remove
+      name: X-Internal-Debug
+```
+
+### 重定向
+
+无需访问上游，直接返回重定向：
+
+```yaml
+action:
+  redirect:
+    status: 301
+    location: "https://example.com/{*rest}"
+```
+
+### 重试策略
+
+自动重试失败的上游请求：
+
+```yaml
+action:
+  upstream: api
+  retry:
+    max_retries: 2
+    backoff: 100ms
+    idempotent_only: true
+```
+
+---
+
+## 流量镜像
+
+流量镜像会把请求副本（全量或采样）发送到影子上游。主请求路径不会被镜像阻塞，镜像任务以 fire-and-forget 方式入队。
+
+### 基础镜像
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: prod
+    mirror: api-shadow
+```
+
+### 高级镜像（采样 + 差异比对）
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: prod
+    mirror:
+      - upstream: api-v2-shadow
+        sample: 0.5
+        timeout: 3s
+        transform:
+          headers:
+            set:
+              X-Shadow: "true"
+              X-Env: staging
+            remove: [X-Real-User, Authorization]
+          path: "/v2$path"
+        compare:
+          enabled: true
+          ignore_headers: [Date, X-Request-Id]
+          ignore_body_fields: ["$.timestamp", "$.request_id"]
+          on_diff: log
+```
+
+### 全局镜像策略
+
+可设置镜像任务内存预算：
+
+```yaml
+defaults:
+  mirror_policy:
+    max_queue_bytes: 52428800
+    on_upstream_error: discard
+    isolation: strict
+```
+
+超过 `max_queue_bytes` 时，新镜像任务会直接丢弃，主请求不受影响。
+
+### 镜像内部流程
+
+1. 主请求收到上游响应后，调用 `submit_all` 提交镜像目标
+2. 每个目标执行：采样判断（无锁 PRNG）→ 内存预留（CAS）→ 非阻塞入队
+3. 如果队列锁竞争，任务会直接丢弃，调用方不会阻塞
+4. worker 线程消费任务并执行：请求变换 → 建连 → 收发 → 可选比对
+
+镜像连接统一使用 `Connection: close`，避免影子连接长期挂起。
+
+### 相关指标
+
+| 指标 | 说明 |
+|---|---|
+| `arc_mirror_submitted_total` | 已入队镜像任务数 |
+| `arc_mirror_sent_total` | 成功转发镜像任务数 |
+| `arc_mirror_queue_full_total` | 队列满导致丢弃 |
+| `arc_mirror_timeout_total` | 超时导致丢弃 |
+| `arc_mirror_upstream_error_total` | 上游错误导致丢弃 |
+| `arc_mirror_status_2xx_total` | 影子流量 2xx 响应数 |
+| `arc_mirror_latency_sum_ns` | 影子流量累计延迟 |
+
+---
+
+## 流量分流
+
+按权重把流量分配到多个上游：
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: api-v1
+    split:
+      choices:
+        - upstream: api-v1
+          weight: 90
+        - upstream: api-v2
+          weight: 10
+      key:
+        source: client_ip
+```
+
+分流使用配置 key 做一致性哈希，因此同一客户端在多次请求中会稳定落到同一上游。
+
+---
+
+## 插件
+
+Arc 支持 WASM 与 Rhai 插件，可在请求生命周期指定阶段执行。
+
+### WASM 插件
+
+WASM 插件是从磁盘加载的 WebAssembly 模块。Arc 使用 Wasmtime + epoch 超时机制约束单次调用 CPU 预算：
+
+```yaml
+plugins:
+  wasm:
+    - name: auth-check
+      file: /etc/arc/plugins/auth-check.wasm
+      budget: 2ms
+```
+
+`on_request` ABI 会接收请求方法和路径，返回值决定处理结果：
+
+| 返回值 | 效果 |
+|---|---|
+| `0` | 放行请求 |
+| 任意 HTTP 状态码 | 直接拒绝并返回该状态码 |
+
+### Rhai 脚本
+
+Rhai 脚本可内联编写，并通过最大操作数做限制：
+
+```yaml
+plugins:
+  rhai:
+    - name: add-headers
+      inline: |
+        request.set_header("X-Via", "arc");
+        request.set_header("X-Node", env("NODE_ID"));
+        0
+      max_ops: 50000
+```
+
+### 绑定插件到路由
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: app
+    plugins:
+      - name: auth-check
+        stage: request_headers
+      - name: add-headers
+        stage: request_headers
+```
+
+同一路由同一阶段的多个插件会按声明顺序执行。
+
+**可用阶段：**
+
+| 阶段 | 时机 |
+|---|---|
+| `l4` | HTTP 解析前，TCP 层 |
+| `request_headers` | 收到请求头后（最常用） |
+| `request_body` | 请求体缓冲完成后 |
+| `response_headers` | 收到上游响应头后 |
+| `response_body` | 收到响应体后 |
+| `log` | 写访问日志时 |
+
+### 插件隔离
+
+每个 worker 拥有独立的 Wasmtime 实例池，插件实例不会跨 worker 共享。WASM 执行超过 `budget` 会被中断，并返回 500。插件内部 panic 会被捕获并计数。
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="路由没有按预期命中">
+Arc 按具体性排序：精确路径优先于通配，长路径优先于短路径。若多个路由同时满足，会选择更具体的一条。建议给每条路由配置 `name`，并通过 `/metrics` 中 `arc_route_requests_total{route="..."}` 观察实际命中；也可以调用 control plane 的 `GET /v1/config` 检查编译后的路由顺序。
+  </Accordion>
+  <Accordion title="路径参数没有被提取">
+请确认使用 `{param}` 语法（例如 `/users/{id}`）。重写规则中可通过 `$param` 取值。`*` 是通配，不会捕获变量；尾部捕获请用 `{*rest}`。
+  </Accordion>
+  <Accordion title="限流触发过于频繁">
+重点检查 `rate_limit.key`。默认 `client_ip` 是按 IP 单独限流。如果需要全局共享桶，可使用 `key: { by: route }` 或多行写法 `key:\n  by: route`。同时可适当提高 `burst` 吸收短时突发。
+  </Accordion>
+  <Accordion title="镜像任务大量丢弃">
+查看 `/metrics` 中 `arc_mirror_queue_full_total`。如果该值增长，说明镜像队列（默认 50MB）已满，可降低 `sample` 或提高 `max_queue_bytes`。若 `arc_mirror_upstream_error_total` 增长，说明镜像上游不可达。
+  </Accordion>
+  <Accordion title="分流比例看起来不稳定">
+权重是相对值，不是百分比。`[{upstream: a, weight: 1}, {upstream: b, weight: 3}]` 表示 25%/75%。分流在小样本下会有抖动，样本足够大才会收敛。
+  </Accordion>
+  <Accordion title="WASM 插件超时">
+单次执行受 `plugins.wasm[].budget` 限制。若业务逻辑确实更重，请提高预算。可通过 `/metrics` 中 `arc_plugin_timeout_total` 确认是否为预算超时导致。
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,66 @@
+openapi: 3.1.0
+info:
+  title: Arc 可观测性管理 API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    管理面可观测性端点的 OpenAPI 定义，接口实现位于 `crates/arc-observability/src/lib.rs`。
+
+    鉴权行为：
+    - 如果配置了管理鉴权令牌，请携带 `Authorization: Bearer <token>`。
+    - 如果未配置令牌，仅允许本机回环地址访问。
+servers:
+  - url: http://127.0.0.1:9090
+security:
+  - bearerAuth: []
+  - {}
+paths:
+  /metrics:
+    get:
+      operationId: getPrometheusMetrics
+      summary: 获取 Prometheus 指标文本
+      responses:
+        '200':
+          description: Prometheus 暴露格式
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          description: 未授权
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: "unauthorized\n"
+
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: 获取健康状态
+      responses:
+        '200':
+          description: 健康
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: "ok\n"
+        '401':
+          description: 未授权
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: "unauthorized\n"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+
+

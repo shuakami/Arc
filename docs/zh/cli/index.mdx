@@ -1,0 +1,183 @@
+---
+title: "CLI 参考"
+description: "`arc` CLI 会读取本地节点 `arc-logging` 产出的 NDJSON 访问日志。它不依赖网络，所有操作都基于本地文件。"
+---
+
+如果你要做多节点日志聚合，建议接入外部采集器（例如 Vector、Fluent Bit）和集中式后端（例如 Loki、Elasticsearch）。
+
+## 命令
+
+```
+arc logs tail [OPTIONS]
+arc logs query [OPTIONS]
+```
+
+### `arc logs tail`
+
+实时跟随日志文件，行为类似 `tail -F`。启动时会先从文件尾部向前回溯 4MB，避免重复处理全量历史，再持续输出新增行。
+
+遇到 EOF 后会 sleep 200ms 并重新打开文件。这个机制可以处理日志轮转：Arc 跟踪的是路径不是 inode，因此同一路径下新文件会被自动跟随。
+
+```bash
+# 跟随所有日志
+arc logs tail
+
+# 只看 error
+arc logs tail --level error
+
+# 按 route 过滤
+arc logs tail --route api
+
+# 只看最近 5 分钟
+arc logs tail --last 5m
+
+# 按状态码过滤
+arc logs tail --status 502
+arc logs tail --status 5xx
+
+# 按 trace_id 跟踪
+arc logs tail --trace-id 4bf92f3577b34da6a3ce929d0e0e4736
+
+# 按客户端 IP 过滤
+arc logs tail --client-ip 203.0.113.5
+```
+
+### `arc logs query`
+
+从文件头（或 `--last` 时间截断点）扫描日志，输出匹配行后退出。
+
+```bash
+# 查询最近 1 小时错误
+arc logs query --last 1h --level error
+
+# 查询最近 30 分钟所有 5xx
+arc logs query --last 30m --status 5xx
+
+# 查询指定上游请求
+arc logs query --upstream app-v2
+
+# 指定日志文件路径
+arc logs query --file /var/log/arc/access.log --last 10m --status 502
+```
+
+---
+
+## 参数
+
+### 通用参数（`tail` / `query`）
+
+| 参数 | 说明 |
+|---|---|
+| `--config <path>` | Arc 配置文件路径。默认 `/etc/arc/config.yaml`。用于解析日志文件路径。 |
+| `--file <path>` | 直接指定日志文件，跳过配置解析。 |
+| `--level <level>` | 按 `level` 精确匹配。可选 `info`、`warn`、`error`、`debug`。 |
+| `--route <name>` | 按 `route` 精确匹配。 |
+| `--status <code>` | 按状态码匹配。支持精确码（如 `502`）和通配（如 `5xx`、`4xx`）。 |
+| `--trace-id <id>` | 按 `trace_id` 精确匹配。 |
+| `--client-ip <ip>` | 按 `client_ip` 精确匹配。 |
+| `--upstream <name>` | 按 `upstream` 精确匹配。 |
+
+### `tail` 独有参数
+
+| 参数 | 说明 |
+|---|---|
+| `--last <duration>` | 仅显示该时间窗口内的日志。例如 `5m`、`1h`、`30s`、`200ms`。 |
+
+### `query` 独有参数
+
+| 参数 | 说明 |
+|---|---|
+| `--last <duration>` | 仅包含相对当前时间更新于该窗口内的日志。 |
+
+---
+
+## 时间格式
+
+| 后缀 | 单位 |
+|---|---|
+| `ms` | 毫秒 |
+| `s` | 秒（无后缀时默认按秒） |
+| `m` | 分钟 |
+| `h` | 小时 |
+
+示例：`5m`、`1h`、`30s`、`200ms`、`3600`（秒）。
+
+---
+
+## 日志文件解析顺序
+
+CLI 按以下顺序确定日志文件路径：
+
+1. 如果传了 `--file`，直接使用
+2. 读取 Arc 配置文件（`--config`，默认 `/etc/arc/config.yaml`）
+3. 解析 `logging.output.file`
+4. 未找到则返回配置错误并退出
+
+---
+
+## 过滤逻辑
+
+所有过滤条件都在客户端执行，多个条件之间是逻辑 AND。无法解析为 JSON 的行会被静默跳过。
+
+`--status` 有两类匹配：
+
+- **精确匹配**：`502`（按整数比较）
+- **通配匹配**：`5xx`、`4xx`（分别匹配 500–599、400–499）
+
+时间窗口规则：若日志 `ts` 早于 `now - duration` 会被跳过；时间戳解析失败时按 fail-open 保留该行。
+
+---
+
+## 运维说明
+
+**仅本地。** CLI 只读取本机文件，不带 HTTP 客户端能力，不能直接查集群其他节点。
+
+**高吞吐建议。** 在高 QPS 场景，建议加 `--last` 收窄扫描范围。`tail` 无论如何都会从 EOF 前 4MB 开始。
+
+**日志轮转。** `tail` 在 EOF 会自动 reopen 路径，因此可跟随轮转后的新文件。
+
+**非 JSON 行。** 不合法 JSON（例如轮转过程中的半行）会被静默忽略。
+
+---
+
+## 示例
+
+```bash
+# 实时观察 5xx
+arc logs tail --status 5xx
+
+# 查询最近 1 小时慢请求（通常会被 force_on_slow 强制记录）
+arc logs query --last 1h --level warn
+
+# 按 trace 定位链路问题
+arc logs query --trace-id 4bf92f3577b34da6a3ce929d0e0e4736
+
+# 查最近 15 分钟某客户端流量
+arc logs query --last 15m --client-ip 203.0.113.5
+
+# 观察 canary 上游
+arc logs tail --upstream app-v2 --status 5xx
+
+# 自定义配置文件路径
+arc logs tail --config /opt/arc/config.yaml --level error
+```
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="No log file found">
+通常是没有传 `--file`，且配置文件中不存在 `logging.output.file`；或者 `--config` 指向了错误路径。请确认 `--config /etc/arc/arc.json`（或你的真实路径）并检查 `logging.output.file`。
+  </Accordion>
+  <Accordion title="arc logs tail 没有输出">
+说明文件存在但没有新日志写入。先确认 Arc 正在运行且有流量；再确认 `observability.access_log.enabled: true`，并且采样率 `sample` 不为 `0.0`。
+  </Accordion>
+  <Accordion title="出现非 JSON 行">
+Arc 产出的是 NDJSON。非 JSON 行（例如日志系统初始化前的启动输出）会被 `arc logs` 自动忽略。如果在原始文件里看到这类内容，通常可以忽略。
+  </Accordion>
+  <Accordion title="--status 2xx 没有结果">
+通配状态码必须用 `xx` 后缀。合法示例：`200`、`2xx`、`4xx`、`5xx`。请确认当前流量里确实存在对应状态码。
+  </Accordion>
+  <Accordion title="日志轮转时 tail 丢行">
+`arc logs tail` 在 EOF 后会等待 200ms 再 reopen。重命名到 reopen 之间极短窗口可能漏少量行。高吞吐排障建议使用 `arc logs query` 并配时间窗口补查。
+  </Accordion>
+</AccordionGroup>

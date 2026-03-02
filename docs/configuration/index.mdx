@@ -1,0 +1,649 @@
+---
+title: "Configuration"
+description: "Arc accepts configuration files in **YAML**, **JSON**, or **TOML** format, detected by file extension (`.yaml`, `.yml`, `.json`, `.toml`). Internally Arc normalizes all formats to canonical JSON."
+---
+
+Unknown fields cause a deserialization error because `#[serde(deny_unknown_fields)]` is applied throughout. Durations use [humantime](https://docs.rs/humantime) format: `"30s"`, `"500ms"`, `"2m"`, etc.
+
+## Top-level structure
+
+```yaml
+io_uring:       # io_uring ring sizing and SQPOLL (restart required to change)
+node:           # runtime capacity settings
+listeners:      # bind addresses and protocols
+upstreams:      # named backend groups
+routes:         # request routing rules
+plugins:        # WASM and Rhai plugin registry
+observability:  # metrics server
+logging:        # access log output, sampling, redaction
+control_plane:  # node-local management API
+```
+
+---
+
+## `node`
+
+Controls worker count, connection limits, and global I/O timeouts.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `id` | string | `"arc-node"` | Human-readable node identifier |
+| `workers` | integer | `0` | Data-plane worker threads. `0` = auto-detect CPU count |
+| `max_connections` | integer | `0` | Hard limit on accepted TCP connections. `0` = unlimited |
+| `read_timeout` | duration | `30s` | Downstream read timeout |
+| `write_timeout` | duration | `30s` | Downstream write timeout |
+| `idle_timeout` | duration | `60s` | Keep-alive idle timeout |
+
+```yaml
+node:
+  id: "arc-prod-1"
+  workers: 0
+  max_connections: 100000
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 60s
+```
+
+---
+
+## `io_uring`
+
+Controls the io_uring ring parameters for each worker thread. All fields require a process restart to change.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `uring_entries` | integer | `2048` | Submission queue ring size (power of 2). Increase if `arc_ring_sq_dropped_total` is non-zero. |
+| `sqpoll` | boolean | `false` | Enable SQPOLL (kernel polling thread). Eliminates all submission syscalls. Requires `CAP_SYS_ADMIN` on kernels < 5.11. Recommended for bare-metal. |
+| `sqpoll_idle_ms` | integer | `2000` | Milliseconds before the SQPOLL kernel thread sleeps when idle. |
+
+<Note>
+If `arc_ring_sq_dropped_total` or `arc_ring_cq_overflow_total` are non-zero, the ring is too small. Double `uring_entries`.
+</Note>
+
+```yaml
+io_uring:
+  uring_entries: 4096   # 4096 for high-traffic nodes
+  sqpoll: true          # recommended for bare-metal
+  sqpoll_idle_ms: 2000
+```
+
+---
+
+## `listeners`
+
+An array of listener entries. Each entry binds one address.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | yes | Identifier, referenced by ACME config |
+| `kind` | string | yes | Protocol type (see below) |
+| `bind` | string | yes | Socket address, e.g. `"0.0.0.0:443"` |
+| `socket` | object | no | OS socket tuning |
+| `tls` | object | no | Required for `https` and `h3` kinds |
+
+**Listener kinds:**
+
+| Value | Description |
+|---|---|
+| `http` | HTTP/1.1 and H2C cleartext |
+| `https` | HTTPS with ALPN (HTTP/1.1 + HTTP/2). Requires `tls` |
+| `h3` | HTTP/3 over QUIC. Requires `tls` |
+| `tcp` | Raw TCP L4 proxy |
+| `udp` | Raw UDP L4 proxy |
+
+**`socket` options:**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `so_reuseport` | boolean | `false` | Enable `SO_REUSEPORT` |
+| `tcp_fastopen_backlog` | integer | null | Enable TCP Fast Open |
+| `dscp` | integer | null | DSCP/TOS byte for QoS |
+| `keepalive` | object | null | TCP keepalive probes (`idle`, `interval`, `count`) |
+
+```yaml
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:8080"
+    socket:
+      so_reuseport: true
+
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      certificates:
+        - sni: "example.com"
+          cert_pem: "./certs/example.com.crt"
+          key_pem: "./certs/example.com.key"
+```
+
+### `tls`
+
+Active only when listener kind is `https` or `h3`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `acme` | object | null | ACME automatic certificate management |
+| `certificates` | array | `[]` | Static certificates loaded at startup |
+| `min_version` | string | null | `tls12` or `tls13` |
+| `max_version` | string | null | Maximum TLS version |
+| `cipher_suites` | string[] | `[]` | Cipher suite preference list (empty = Rustls defaults) |
+| `session_resumption` | boolean | `true` | Enable TLS session resumption |
+
+**`certificates` entries:**
+
+| Field | Description |
+|---|---|
+| `sni` | Hostname. Exact match or wildcard (`"*.example.com"`) |
+| `cert_pem` | Path to PEM certificate chain |
+| `key_pem` | Path to PEM private key |
+
+The first certificate in the array is the default when no SNI matches.
+
+### `tls.acme`
+
+Enables automatic certificate issuance and renewal from an ACME CA.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `email` | string | null | Contact email for the ACME account |
+| `directory_url` | string | Let's Encrypt | ACME directory endpoint |
+| `account_key` | object | required | Key configuration |
+| `domains` | string[] | required | Hostnames to obtain certificates for |
+| `challenge` | object | required | Challenge method |
+| `renew_before` | duration | `720h` | Renewal lead time before expiry |
+
+**`account_key`:**
+
+| Field | Description |
+|---|---|
+| `algorithm` | `ed25519` or `rsa2048` |
+| `encrypted_key_path` | Path to encrypted key file |
+| `passphrase` | `{ type: env, name: VAR }` or `{ type: file, path: /path }` |
+
+**`challenge` types:**
+
+| `type` | Extra fields | Description |
+|---|---|---|
+| `http_01` | `listener` | HTTP-01 via named listener (must be port 80) |
+| `tls_alpn_01` | `listener` | TLS-ALPN-01 via named TLS listener |
+| `dns_01` | `provider` | DNS-01 via Cloudflare, Route53, RFC2136, webhook, or hook |
+
+Full ACME configuration example:
+
+```yaml
+tls:
+  acme:
+    email: you@example.com
+    domains: [example.com, www.example.com]
+    account_key:
+      algorithm: ed25519
+      encrypted_key_path: /etc/arc/acme-key.enc
+      passphrase:
+        type: env
+        name: ACME_KEY_PASSPHRASE
+    challenge:
+      type: tls_alpn_01
+      listener: https
+    renew_before: 720h
+```
+
+---
+
+## `upstreams`
+
+An array of named backend groups. Routes reference upstreams by `name`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | required | Identifier referenced in route actions |
+| `discovery` | object | required | How endpoints are found |
+| `lb` | object | `peak_ewma` | Load balancing algorithm |
+| `health` | object | (empty) | Active and passive health checks |
+| `pool` | object | see below | Connection pool settings |
+| `timeouts` | object | see below | Per-upstream timeout overrides |
+
+### `discovery`
+
+**Static endpoints:**
+
+```yaml
+discovery:
+  type: static
+  endpoints:
+    - address: "10.0.0.1:3000"
+      weight: 1
+    - address: "10.0.0.2:3000"
+      weight: 2
+```
+
+**DNS-based discovery:**
+
+```yaml
+discovery:
+  type: dns
+  hostname: api.internal
+  port: 3000
+  respect_ttl: true
+  fallback_poll: 10s
+```
+
+### `lb` — load balancing
+
+| `algorithm` | Extra fields | Description |
+|---|---|---|
+| `round_robin` | — | Uniform distribution |
+| `weighted_round_robin` | — | Weighted by `endpoint.weight` |
+| `least_requests` | — | Fewest in-flight requests |
+| `consistent_hash` | `key`, `virtual_nodes` | Ketama consistent hashing |
+| `peak_ewma` | `decay` (duration) | Peak EWMA latency-based selection |
+
+Consistent hash key sources: `client_ip`, `header` (with `name`), or `cookie` (with `name`).
+
+### `health`
+
+**Active health checks** (proactive polling):
+
+```yaml
+health:
+  active:
+    interval: 10s
+    path: /health
+    fail_after: 3
+    pass_after: 2
+```
+
+**Passive health checks** (outlier ejection):
+
+```yaml
+health:
+  passive:
+    error_rate_threshold: 0.2
+    window: 30s
+    ejection_time: 60s
+```
+
+### `pool` — connection pool
+
+| Field | Default | Description |
+|---|---|---|
+| `max_idle` | `1024` | Maximum idle connections per upstream |
+| `idle_ttl` | `30s` | Evict idle connections older than this |
+| `max_lifetime` | `300s` | Maximum total connection lifetime |
+
+### `timeouts` — upstream timeouts
+
+| Field | Default | Description |
+|---|---|---|
+| `connect` | `2s` | TCP connection establishment timeout |
+| `write` | `30s` | Timeout writing request to upstream |
+| `ttfb` | `5s` | Time-to-first-byte after request sent |
+| `read` | `30s` | Full response read timeout |
+
+### `tls` — upstream TLS
+
+Optional. When present, Arc opens TLS connections to the upstream endpoints.
+
+| Field | Default | Description |
+|---|---|---|
+| `ca_pem` | null | CA certificate path for verifying the upstream's TLS certificate |
+| `client_cert_pem` | null | Client certificate path (for mutual TLS) |
+| `client_key_pem` | null | Client private key path (for mutual TLS) |
+| `insecure` | `false` | Skip server certificate verification. Use only in development. |
+
+See [TLS & Certificates](/tls-and-certificates) for full upstream TLS examples.
+
+---
+
+## `routes`
+
+An array of route rules. Routes are evaluated by specificity — exact matches win over wildcards; longer patterns win over shorter ones.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | required | Route identifier (used in logs and plugins) |
+| `match` | object | required | Match predicates |
+| `action` | object | required | What to do when matched |
+| `rate_limit` | object | null | Per-route rate limiting |
+| `mirror` | object | null | Traffic mirroring |
+| `split` | object | null | Weighted traffic split |
+| `plugins` | array | `[]` | Plugins attached to this route |
+
+### `match`
+
+| Field | Default | Description |
+|---|---|---|
+| `host` | `[]` | Hostname(s). Empty = any host |
+| `methods` | `[]` | HTTP methods. Empty = any method |
+| `path` | required | Path pattern |
+| `headers` | `[]` | Header predicates (all must match) |
+| `cookies` | `[]` | Cookie predicates |
+| `query` | `[]` | Query parameter predicates |
+| `expr` | null | Boolean expression combining named matchers (AND/OR/NOT) |
+
+**Path patterns:**
+
+| Pattern | Example | Behavior |
+|---|---|---|
+| Exact | `/api/v1/users` | Exact match only |
+| Capture | `/users/{id}` | Captures a path segment |
+| Tail capture | `/{*rest}` | Captures the remainder |
+| Wildcard | `/static/*` | Any single segment |
+
+**Header predicates** (`op` field): `exists`, `contains`, `regex`, `equals`. All require `name`; value-based ops also require `value` or `pattern`.
+
+### `action`
+
+| Field | Default | Description |
+|---|---|---|
+| `upstream` | required | Name of the upstream group |
+| `rewrite` | null | URL rewrite (`pattern` + `replace`) |
+| `headers` | `[]` | Header mutations before forwarding |
+| `redirect` | null | Short-circuit redirect (`status` + `location`) |
+| `retry` | see below | Retry policy |
+
+**Header mutations** (`op` field): `add`, `set`, `remove`.
+
+**Retry policy:**
+
+| Field | Default | Description |
+|---|---|---|
+| `max_retries` | `1` | Maximum retry attempts |
+| `backoff` | `50ms` | Fixed delay between retries |
+| `idempotent_only` | `true` | Only retry GET, HEAD, OPTIONS, etc. |
+
+### `rate_limit`
+
+| Field | Default | Description |
+|---|---|---|
+| `qps` | required | Token bucket refill rate |
+| `burst` | required | Token bucket capacity (max burst) |
+| `key` | `client_ip` | Keying strategy |
+| `status` | `429` | HTTP status when limit exceeded |
+
+Key strategies: `client_ip`, `header` (with `name`), or `route` (single shared limit).
+
+### `mirror`
+
+```yaml
+# Shorthand
+mirror: api-shadow
+
+# Full form with options
+mirror:
+  - upstream: api-v2-shadow
+    sample: 0.5
+    timeout: 3s
+    transform:
+      headers:
+        set: { X-Shadow: "true" }
+        remove: [X-Real-User]
+      path: "/v2$path"
+    compare:
+      enabled: true
+      ignore_headers: [Date]
+      ignore_body_fields: ["$.timestamp"]
+      on_diff: log
+```
+
+### `split` — traffic split
+
+```yaml
+split:
+  choices:
+    - upstream: app-v1
+      weight: 90
+    - upstream: app-v2
+      weight: 10
+  key:
+    source: client_ip
+```
+
+---
+
+## `plugins`
+
+Global plugin registry. Routes reference plugins by name.
+
+```yaml
+plugins:
+  wasm:
+    - name: my-filter
+      file: ./plugins/my-filter.wasm
+      budget: 2ms
+
+  rhai:
+    - name: add-header
+      inline: |
+        request.set_header("X-Via", "arc");
+        0
+      max_ops: 50000
+```
+
+### WASM plugin fields
+
+| Field | Default | Description |
+|---|---|---|
+| `name` | required | Plugin identifier |
+| `file` | required | Path to `.wasm` binary |
+| `budget` | `2ms` | CPU time budget per invocation |
+
+### Rhai script fields
+
+| Field | Default | Description |
+|---|---|---|
+| `name` | required | Script identifier |
+| `inline` | required | Inline Rhai source code |
+| `max_ops` | `50000` | Operation count limit per invocation |
+
+### Attaching plugins to a route
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: app
+    plugins:
+      - name: my-filter
+        stage: request_headers
+```
+
+**Plugin stages:**
+
+| Value | Description |
+|---|---|
+| `l4` | L4 TCP layer, before HTTP parsing |
+| `request_headers` | After request headers are received |
+| `request_body` | After request body is buffered |
+| `response_headers` | After upstream response headers arrive |
+| `response_body` | After response body is received |
+| `log` | At access log emission time |
+
+---
+
+## `observability`
+
+Controls the metrics and admin server. See also `logging` below for access log configuration.
+
+| Field | Default | Description |
+|---|---|---|
+| `metrics_bind` | `"127.0.0.1:9090"` | Prometheus `/metrics` bind address |
+| `metrics_enabled` | `true` | Enable the metrics endpoint |
+| `tracing` | null | OTLP tracing export (`endpoint`, `insecure`) |
+
+```yaml
+observability:
+  metrics_bind: "0.0.0.0:9090"   # expose to all interfaces (protect with firewall)
+  metrics_enabled: true
+  tracing:
+    endpoint: "http://otel-collector:4317"
+    insecure: true
+```
+
+---
+
+## `logging`
+
+Controls the structured NDJSON access log. `logging` is a top-level key, separate from `observability`.
+
+**`logging.output`:**
+
+| Field | Default | Description |
+|---|---|---|
+| `logging.output.file` | `/var/log/arc/access.log` | Output file path |
+| `logging.output.stdout` | `false` | Also write to stdout |
+| `logging.output.rotation.max_size` | `500mb` | Rotate when the file reaches this size |
+| `logging.output.rotation.max_files` | `30` | Number of rotated files to keep |
+| `logging.output.rotation.compress` | `true` | Gzip compress rotated files |
+
+**`logging.access`:**
+
+| Field | Default | Description |
+|---|---|---|
+| `logging.access.sample` | `0.01` | Fraction of requests to log (0.0–1.0). This is the main sampling control. |
+| `logging.access.force_on_status` | `[401,403,429,500,502,503,504]` | Always log these status codes, regardless of `sample` |
+| `logging.access.force_on_slow` | `500` | Always log requests slower than this many **milliseconds**, regardless of `sample` |
+
+> `observability.access_log.sample` (default `1.0`) and `logging.access.sample` (default `0.01`) are two separate fields. `observability.access_log.sample` is an older knob; `logging.access.sample` overrides it. Use `logging.access.sample` for all new configuration.
+
+**`logging.redact`:**
+
+| Field | Default | Description |
+|---|---|---|
+| `logging.redact.headers` | `["Authorization","Cookie",…]` | Headers replaced with `[REDACTED]` |
+| `logging.redact.query_params` | `["token","secret",…]` | Query params replaced with `[REDACTED]` |
+
+**`logging.writer`:**
+
+| Field | Default | Description |
+|---|---|---|
+| `logging.writer.ring_capacity` | `8192` | SPSC ring buffer size per worker (entries) |
+| `logging.writer.batch_bytes` | `262144` | Flush when batch reaches this size (bytes) |
+| `logging.writer.flush_interval` | `50` | Time-based flush interval (milliseconds) |
+
+```yaml
+logging:
+  output:
+    file: /var/log/arc/access.log
+    stdout: false
+    rotation:
+      max_size: 500mb
+      max_files: 30
+      compress: true
+  access:
+    sample: 0.01
+    force_on_status: [401, 403, 429, 500, 502, 503, 504]
+    force_on_slow: 500
+  redact:
+    headers: [Authorization, Cookie, X-Api-Key]
+    query_params: [token, secret, password]
+```
+
+---
+
+## `control_plane`
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Master switch. The server does not start unless `true`. |
+| `bind` | `"127.0.0.1:22100"` | Control plane HTTP server listen address |
+| `role` | `standalone` | `standalone`, `leader`, or `follower` |
+| `node_id` | hostname | Unique node name for cluster gossip |
+| `peers` | `[]` | Peer base URLs for leader-initiated HTTP push |
+| `quorum` | `0` | Minimum nodes that must accept config before commit. `0` = majority |
+| `auth_token` | null | Bearer token. `null` = loopback-only, no auth |
+| `pull_from` | null | Leader URL for follower long-poll |
+| `longpoll_timeout_ms` | `30000` | Server-side hold duration for long-poll requests |
+| `peer_timeout_ms` | `5000` | HTTP timeout for peer-to-peer validate/commit calls |
+| `peer_concurrency` | `16` | Max parallel peer calls during cluster config push |
+| `runtime_threads` | `2` | Tokio worker thread count for the control-plane runtime |
+| `compile_threads` | `2` | `spawn_blocking` thread cap for JSON compile work |
+| `max_body_bytes` | `16 MiB` | Maximum request body size for config endpoints |
+
+All `control_plane` fields require a process restart to change.
+
+See [Gateway control plane API reference](/api-reference/gateway-control-plane) for endpoint documentation.
+
+---
+
+## Complete example
+
+```yaml
+node:
+  id: "prod-1"
+  workers: 0
+  max_connections: 100000
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 60s
+
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:8080"
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      certificates:
+        - sni: "*.example.com"
+          cert_pem: /etc/arc/certs/wildcard.crt
+          key_pem: /etc/arc/certs/wildcard.key
+
+upstreams:
+  - name: api
+    discovery:
+      type: static
+      endpoints:
+        - address: "10.0.1.1:3000"
+        - address: "10.0.1.2:3000"
+    lb:
+      algorithm: peak_ewma
+      decay: 10s
+    health:
+      active:
+        interval: 10s
+        path: /health
+    pool:
+      max_idle: 512
+      idle_ttl: 30s
+    timeouts:
+      connect: 2s
+      ttfb: 5s
+
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+      methods: [GET, POST, PUT, DELETE]
+    action:
+      upstream: api
+      retry:
+        max_retries: 2
+        backoff: 100ms
+        idempotent_only: true
+    rate_limit:
+      qps: 1000
+      burst: 2000
+      key:
+        by: client_ip
+
+  - name: root
+    match:
+      path: /{*rest}
+    action:
+      upstream: api
+
+observability:
+  metrics_bind: "127.0.0.1:9090"
+
+control_plane:
+  enabled: true
+  bind: "127.0.0.1:22100"
+  auth_token: "your-secret-token"
+```
+
+

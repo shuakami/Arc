@@ -1,0 +1,210 @@
+---
+title: "Getting Started"
+description: "This guide takes you from zero to a running Arc instance in about five minutes. By the end you will have Arc proxying HTTP traffic, with rate limits applied and TLS optional."
+---
+
+## Requirements
+
+| Requirement | Minimum | Recommended |
+|---|---|---|
+| Linux kernel | 5.10 | 6.1+ |
+| `curl` and `sudo` | latest | latest |
+| `sha256sum` | available | from coreutils |
+| Redis (optional) | 6.0 | 7.x — only needed for cluster-wide rate limiting |
+
+Kernel 6.1+ is recommended for multishot accept and SQPOLL stability. Check your version:
+
+```bash
+uname -r
+```
+
+## Step 1 — Install Arc (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/install.sh | sh
+arc-gateway --help
+```
+
+The installer script downloads the latest GitHub Release, verifies SHA256, and installs `arc-gateway` to `/usr/local/bin/arc-gateway`. It currently supports Linux `x86_64` and Linux `arm64`.
+
+## Step 2 — Write a minimal config
+
+Arc accepts JSON, TOML, or YAML, detected by file extension. Create `arc.yaml`:
+
+```yaml
+node:
+  workers: 0          # 0 = auto-detect CPU count from available_parallelism()
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 60s
+
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:8080"
+
+observability:
+  metrics_bind: "127.0.0.1:9090"
+
+upstreams:
+  - name: app
+    discovery:
+      type: static
+      endpoints:
+        - address: "127.0.0.1:3000"
+    pool:
+      max_idle: 128
+      idle_ttl: 30s
+
+routes:
+  - name: root
+    match:
+      path: "/{*rest}"
+    action:
+      upstream: app
+```
+
+## Step 3 — Start a test backend
+
+Any HTTP server on port 3000 works. Python's built-in server is enough for testing:
+
+```bash
+python3 -m http.server 3000 &
+```
+
+## Step 4 — Run Arc
+
+```bash
+arc-gateway --config arc.yaml
+```
+
+## Step 5 — Verify
+
+```bash
+# Proxied response from the backend
+curl -i http://localhost:8080/
+
+# Health check
+curl http://localhost:9090/healthz
+# Expected: ok
+
+# Prometheus metrics
+curl http://localhost:9090/metrics
+# Look for: arc_requests_total, arc_active_current
+```
+
+## Add rate limiting
+
+Rate limits use GCRA (Generic Cell Rate Algorithm). Add a `rate_limit` block to any route:
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: app
+    rate_limit:
+      qps: 100
+      burst: 200
+      key:
+        by: client_ip
+```
+
+Save the file. Arc watches for config changes and applies them within ~500 ms without dropping connections.
+
+## Add TLS
+
+Generate or obtain a certificate, then add a TLS listener:
+
+```yaml
+listeners:
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      certificates:
+        - sni: example.com
+          cert_pem: ./certs/example.com.crt
+          key_pem: ./certs/example.com.key
+```
+
+Certificate files are read at startup and re-read on hot reload. For automatic certificate issuance, see [TLS & Certificates](/tls-and-certificates).
+
+## Add ACME (Let's Encrypt)
+
+```yaml
+listeners:
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      acme:
+        email: you@example.com
+        domains: [example.com]
+        account_key:
+          algorithm: ed25519
+          encrypted_key_path: ./acme-key.enc
+          passphrase:
+            type: env
+            name: ACME_KEY_PASSPHRASE
+        challenge:
+          type: tls_alpn_01
+          listener: https
+```
+
+## Hot reload
+
+Arc monitors config file modification times. After any change:
+
+```bash
+# via systemd
+systemctl reload arc-gateway
+
+# directly
+kill -HUP $(pidof arc-gateway)
+```
+
+Changes to listener addresses, worker count, io_uring ring sizing, or control plane binding require a process restart. All other changes (routes, upstreams, rate limits, TLS certs, plugins) apply live.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Arc starts but `curl http://localhost:8080/` returns a connection refused">
+Check that the listener `bind` address and port match what you are curling. If you bound to `127.0.0.1:8080` you cannot reach it from another machine.
+  </Accordion>
+  <Accordion title="io_uring: Operation not permitted">
+io_uring requires Linux 5.10+. On kernels between 5.10 and 5.19, some SQPOLL operations may require elevated privileges. Set `RLIMIT_MEMLOCK` or run with `CAP_SYS_ADMIN`. In containers, ensure `seccomp` does not block `io_uring` syscalls.
+  </Accordion>
+  <Accordion title="/healthz returns 401 Unauthorized">
+The control plane `auth_token` is set but the request does not include it. Add the header: `curl -H "Authorization: Bearer <token>" http://localhost:22100/healthz`.
+  </Accordion>
+  <Accordion title="Config change is not taking effect">
+Confirm the mtime of the file changed (some editors write to a temp file and rename). Send `SIGHUP` manually: `kill -HUP $(pidof arc-gateway)`. Check `arc_config_reload_total` in `/metrics` to confirm a reload fired.
+  </Accordion>
+  <Accordion title="TLS: certificate not served for a domain">
+Ensure the `sni` field in `certificates` exactly matches the hostname (or uses a wildcard like `*.example.com`). The first certificate in the array is the default fallback when no SNI matches.
+  </Accordion>
+  <Accordion title="ACME: challenge validation fails">
+TLS-ALPN-01 requires port 443 to be reachable. HTTP-01 requires port 80. Check firewall rules and that the listener `bind` address is publicly routable. ACME errors are written to the access log with `kind: "system"`.
+  </Accordion>
+</AccordionGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="sliders" href="/configuration">
+    Every config field explained.
+  </Card>
+  <Card title="Security" icon="shield" href="/security">
+    XDP, rate limiting, L7 protection.
+  </Card>
+  <Card title="Deployment" icon="server" href="/deployment">
+    Systemd and Kubernetes guides.
+  </Card>
+  <Card title="Observability" icon="chart-line" href="/observability">
+    Metrics, logs, tracing.
+  </Card>
+</CardGroup>
+
+

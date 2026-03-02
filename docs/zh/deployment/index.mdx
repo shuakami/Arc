@@ -1,0 +1,249 @@
+---
+title: "部署"
+description: "本页说明如何在生产环境安装并运行 Arc，包含 systemd 服务单元和 Kubernetes 清单。"
+---
+
+## 前置条件
+
+| 要求 | 最低版本 | 推荐版本 |
+|---|---|---|
+| Linux 内核 | 5.10 | 6.1+ |
+| `curl` 与 `sudo` | 最新版本 | 最新版本 |
+| `sha256sum` | 可用 | 建议使用 coreutils 版本 |
+| Redis（可选） | 6.0 | 7.x |
+
+为了保证 multishot accept 和 SQPOLL 稳定性，建议使用 6.1+ 内核。先确认你的内核版本：
+
+```bash
+uname -r
+```
+
+## 安装二进制
+
+### 方式 A（推荐）：用 `install.sh` 安装最新 Release
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/install.sh | sh
+arc-gateway --help
+```
+
+这个脚本会自动识别架构，下载最新 GitHub Release 二进制，完成 SHA256 校验，然后安装到 `/usr/local/bin/arc-gateway`。
+
+当前发布资产是 `arc-gateway-linux-x86_64` 和 `arc-gateway-linux-arm64`。
+
+## Systemd（裸机或虚机）
+
+### 安装
+
+先安装 systemd 服务单元和默认配置文件：
+
+```bash
+sudo install -d -m 0755 /etc/arc
+sudo curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/arc.example.json -o /etc/arc/arc.json
+sudo curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/deploy/arc-gateway.service -o /etc/systemd/system/arc-gateway.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable arc-gateway
+```
+
+这个服务单元默认读取：
+- 二进制：`/usr/local/bin/arc-gateway`
+- 配置文件：`/etc/arc/arc.json`
+
+编辑配置后启动服务：
+
+```bash
+# 编辑配置
+sudo vim /etc/arc/arc.json
+
+# 启动 Arc
+sudo systemctl start arc-gateway
+
+# 查看状态
+sudo systemctl status arc-gateway
+```
+
+### 服务单元参数
+
+服务单元路径：`/etc/systemd/system/arc-gateway.service`。
+
+| 指令 | 值 | 作用 |
+|---|---|---|
+| `ExecStart` | `/usr/local/bin/arc-gateway --config /etc/arc/arc.json` | 启动主进程 |
+| `ExecReload` | `/bin/kill -HUP $MAINPID` | 触发热更新 |
+| `Restart` | `on-failure` | 异常退出自动拉起 |
+| `RestartSec` | `5s` | 重启间隔 |
+| `TimeoutStopSec` | `35s` | SIGKILL 前的优雅退出窗口 |
+| `WatchdogSec` | `60s` | systemd watchdog 周期 |
+| `LimitNOFILE` | `1048576` | 最大文件描述符数 |
+| `LimitNPROC` | `65536` | 最大进程数 |
+
+默认开启的安全加固项：
+
+- `NoNewPrivileges=yes`
+- `PrivateTmp=yes`
+- `ProtectSystem=strict`
+- `ProtectHome=yes`
+- `ProtectKernelTunables=yes`
+- `ProtectControlGroups=yes`
+- `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`
+
+### 热更新
+
+修改 `/etc/arc/arc.json` 后执行：
+
+```bash
+# 通过 systemd
+sudo systemctl reload arc-gateway
+
+# 或直接发信号
+sudo kill -HUP $(pidof arc-gateway)
+```
+
+现有连接不会被强制断开。如果新配置修改了监听地址、worker 数、io_uring ring 尺寸或 control plane 绑定地址，热更新会被拒绝，此时需要完整重启进程。
+
+### 常用命令
+
+```bash
+# 跟随日志
+sudo journalctl -u arc-gateway -f
+
+# 查看指标
+curl http://localhost:9090/metrics
+
+# 健康检查
+curl http://localhost:9090/healthz
+```
+
+---
+
+## Kubernetes
+
+Kubernetes 清单都在 `deploy/kubernetes/` 下，按顺序应用：
+
+```bash
+kubectl apply -f deploy/kubernetes/namespace.yaml
+kubectl apply -f deploy/kubernetes/secret.yaml
+kubectl apply -f deploy/kubernetes/configmap.yaml
+kubectl apply -f deploy/kubernetes/deployment.yaml
+kubectl apply -f deploy/kubernetes/service.yaml
+kubectl apply -f deploy/kubernetes/hpa.yaml
+```
+
+### 创建的资源
+
+| 资源 | 说明 |
+|---|---|
+| Namespace | `arc-gateway` |
+| ConfigMap | `arc-gateway-config`，包含 `arc.toml` |
+| Secret | `arc-gateway-secret`，包含 `auth-token` |
+| Deployment | `replicas=2`，滚动更新 |
+| Service（ClusterIP） | 暴露 8080、8443、9090 |
+| Service（NodePort） | NodePort 30080（HTTP）、30443（HTTPS） |
+| HPA | 基于 CPU 的自动扩缩容 |
+
+### 应用前：先设置认证 token
+
+在部署前，Secret 必须写入真实 token：
+
+```bash
+# 编辑 deploy/kubernetes/secret.yaml，将 __ARC_TOKEN__ 替换成真实值
+# 然后应用
+kubectl apply -f deploy/kubernetes/secret.yaml
+```
+
+同时保持 ConfigMap 里的 `control_plane.auth_token` 与该值一致。
+
+### 建议覆盖的 ConfigMap 关键字段
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `workers` | `0`（自动） | 建议按 Pod CPU limit 设置，性能更可预测 |
+| `control_plane.auth_token` | `__ARC_TOKEN__` | 必须替换 |
+| `io_uring.sqpoll` | `false` | 裸机场景可开启 |
+| `upstreams[0].addr` | `127.0.0.1:18080` | 指向你的后端服务 |
+
+### Deployment 规格
+
+| 字段 | 值 |
+|---|---|
+| `replicas` | 2 |
+| `strategy` | RollingUpdate，`maxSurge=1`，`maxUnavailable=0` |
+| `terminationGracePeriodSeconds` | 35 |
+| HTTP 端口 | 8080 |
+| HTTPS 端口 | 8443 |
+| 管理端口 | 9090 |
+| CPU request/limit | `500m` / `2000m` |
+| 内存 request/limit | `256Mi` / `1Gi` |
+
+**存活探针：** `GET /healthz`（9090 端口），`initialDelaySeconds=5`，`periodSeconds=10`
+
+**就绪探针：** `GET /healthz`（9090 端口），`initialDelaySeconds=3`，`periodSeconds=5`
+
+### 优雅下线
+
+`preStop` hook 会先执行 `sleep 5`，给负载均衡器留出摘流时间，再由容器接收 `SIGTERM`。`terminationGracePeriodSeconds=35` 与该下线窗口对齐。
+
+### Kubernetes 中的 XDP/eBPF
+
+XDP 需要 `NET_ADMIN` 和 `SYS_ADMIN` capability，并要求 `privileged: true`。默认清单里是关闭状态（注释掉的 YAML），多数托管 Kubernetes 平台也不支持这类能力。
+
+---
+
+## 启动流程（arc-daemon）
+
+执行 `arc-gateway --config arc.yaml` 后的启动序列如下：
+
+```
+main()
+  │
+  ├── load config from file
+  ├── compile config → SharedConfig
+  ├── (if control_plane.enabled) spawn control plane thread
+  │       └── axum router: /v1/status, /v1/config, /v1/cluster/*, /v1/xdp/*
+  │
+  ├── configure Pingora Server (worker count, keepalive pool)
+  ├── register HTTP proxy service (ArcProxy)
+  ├── configure listeners (HTTP/HTTPS/TCP/UDP)
+  ├── (if metrics_enabled) register Prometheus service
+  └── server.run_forever()
+```
+
+worker 数来自 `node.workers`。如果设置为 `0`，会使用 `std::thread::available_parallelism()` 自动识别。
+
+---
+
+## 生产上线检查清单
+
+上线前建议逐项确认：
+
+- [ ] 将 `node.workers` 设为 `0`（自动）或按进程可用 CPU 核数固定
+- [ ] 按预期并发连接量设置 `max_connections`
+- [ ] 在 systemd 单元里设置 `LimitNOFILE`（默认 `1048576`）
+- [ ] 在监听器启用 `SO_REUSEPORT`，让 Arc 在多 worker 间无锁分摊连接
+- [ ] 按峰值并发请求调整上游 `pool.max_idle`
+- [ ] 如果 control plane 对外可达，务必设置高强度随机 `control_plane.auth_token`
+- [ ] 将指标服务绑定到回环地址（`observability.metrics_bind: "127.0.0.1:9090"`）或用防火墙保护 9090；该端点没有内建鉴权
+- [ ] 配置日志轮转（`logging.output.rotation.max_size` 与 `max_files`）
+- [ ] 在 Prometheus 加入 `<host>:9090/metrics` 采集目标
+- [ ] 验证热更新：`kill -HUP <pid>` 后确认 `/metrics` 中 `arc_config_reload_total` 递增
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="systemd: Failed to start arc-gateway.service">
+先看 `journalctl -xe -u arc-gateway`。最常见原因是 `ExecStart` 指向的二进制不存在，或配置文件路径写错。可用 `arc-gateway --config /etc/arc/arc.json --check`（如果版本支持 `--check`）辅助验证，或直接检查启动日志。
+  </Accordion>
+  <Accordion title="Arc 重启循环并提示 io_uring: Operation not supported">
+当前内核可能不支持请求的 io_uring 特性。可先关闭 SQPOLL（`io_uring.sqpoll: false`），并适当调小 `uring_entries`。最低要求内核为 Linux 5.10。
+  </Accordion>
+  <Accordion title="Kubernetes Pod 卡在 CrashLoopBackOff">
+执行 `kubectl logs -n arc-system <pod>` 排查。常见原因包括：`arc-gateway-secret` 不存在或缺少 `auth-token`；ConfigMap 的 `arc.toml` 指向了启动阶段不可达的上游地址；资源上限过低，需要提高 `resources.limits.memory`。
+  </Accordion>
+  <Accordion title="bind: address already in use">
+说明端口被其他进程占用。可用 `ss -tlnp | grep 8080` 检查。如果是 Pod 重启场景，可能旧 Pod 尚未完全退出，可适当增大 `terminationGracePeriodSeconds`。
+  </Accordion>
+  <Accordion title="Hot reload（SIGHUP）不生效">
+`node.workers`、监听器 `bind` 地址和 `io_uring.uring_entries` 等字段必须完整重启才能生效，其他字段才可在线生效。可检查 `arc_config_reload_total` 确认是否触发了热更新。
+  </Accordion>
+</AccordionGroup>

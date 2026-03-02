@@ -1,0 +1,250 @@
+---
+title: "Security"
+description: "Production HTTP services face threats at every layer of the stack: volumetric floods at the network layer, connection exhaustion at L4, and malformed or abusive requests at L7. Arc addresses all three independently so that a saturated kernel filter does not block legitimate L7 rate limiting from firing, and vice versa."
+---
+
+Arc applies security at three independent layers. Each layer operates at a different level of the network stack and can drop or throttle traffic independently of the others.
+
+```
+Internet traffic
+    │
+    ▼ L3/L4 — Kernel
+arc-xdp kernel program (XDP hook, pre-TCP-stack)
+  BPF maps: blacklist, whitelist
+  SYN-flood detection, RST validation, ACK flood detection
+    │ XDP_PASS
+    ▼ L4/L7 — Worker
+SlowlorisGuard — per-connection header-phase timeout/rate
+TlsFloodGuard — TLS handshake rate per IP
+H2StreamFloodGuard — concurrent streams and RST rate
+    │
+    ▼ L7 — Request
+WorkerLimiter / GlobalRateLimiter
+  GCRA token bucket, Redis backend, circuit breaker
+    │
+    ▼
+Upstream proxy / Application
+```
+
+---
+
+## XDP and eBPF packet filtering
+
+Arc's kernel program (`arc-xdp`) attaches to a NIC at the XDP hook point and processes every inbound packet before the kernel TCP stack sees it. It runs entirely in the kernel with no context switch to userspace per packet.
+
+### What it checks
+
+For each packet:
+
+1. Parse Ethernet + optional VLAN headers
+2. Parse IPv4 or IPv6 to extract the source IP
+3. Check the **whitelist** — IP in whitelist → `XDP_PASS` immediately
+4. Check the **blacklist** — IP in blacklist (not expired) → `XDP_DROP`
+5. For TCP packets:
+   - SYN flood scoring (exponential decay per IP)
+   - SYN proxy (syncookie SYN-ACK, validate returning ACK)
+   - RST validation (sequence number window check)
+   - ACK flood scoring
+6. For UDP packets: per-port PPS/BPS rate limiting
+
+### BPF maps
+
+| Map | Type | Capacity | Description |
+|---|---|---|---|
+| `arc_whitelist` | HASH | 65,536 | Always-pass IPs |
+| `arc_blacklist` | LRU_HASH | 1,000,000 | Blocked IPs with TTL |
+| `arc_syn_state` | PERCPU_HASH | 500,000 | Per-IP SYN scoring state |
+| `arc_global_stats` | PERCPU_ARRAY | 1 (per-CPU) | Global packet statistics |
+| `arc_conntrack` | LRU_HASH | 2,000,000 | TCP connection tracking |
+| `arc_config` | ARRAY | 1 | Runtime config flags (written by userspace) |
+| `arc_events` | RINGBUF | 4 MiB | Events to userspace |
+| `arc_port_stats` | PERCPU_ARRAY | 65,536 | UDP per-port statistics |
+
+All maps are pinned to `/sys/fs/bpf/arc/`.
+
+### Feature flags
+
+Enable or disable XDP features at runtime using `POST /v1/xdp/config` on the control plane:
+
+```bash
+# Enable SYN flood detection + SYN proxy (flags = 1 + 2 = 3)
+curl -X POST http://localhost:22100/v1/xdp/config \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"flags": 3}'
+```
+
+| Flag | Effect |
+|---|---|
+| `CFG_F_ENABLE_SYN_FLOOD` | Per-IP SYN scoring; drop when threshold exceeded |
+| `CFG_F_ENABLE_SYN_PROXY` | Respond with syncookie SYN-ACK; validate returning ACKs |
+| `CFG_F_ENABLE_RST_VALIDATE` | Drop RSTs outside the tracked sequence window |
+| `CFG_F_ENABLE_ACK_FLOOD` | Per-IP ACK-only scoring and drop |
+| `CFG_F_GLOBAL_DEFENSE_MODE` | Tighten all thresholds (auto-activated on attack detection) |
+| `CFG_F_ENABLE_UDP_STATS` | Count UDP packets per destination port |
+| `CFG_F_ENABLE_UDP_RATE_LIMIT` | Drop UDP packets exceeding per-port PPS/BPS limits |
+| `CFG_F_ENABLE_CIDR_LOOKUP` | Enable CIDR prefix matching (additional map lookups) |
+| `CFG_F_DROP_IPV4_FRAGS` | Drop IPv4 fragments to prevent L4 header bypass |
+
+### Dynamic threshold calculation
+
+The userspace manager runs a background task every 100ms that uses a Welford online algorithm to compute a running mean and standard deviation of the observed SYN rate. The dynamic threshold is:
+
+```
+threshold = mean + sigma_multiplier × sigma
+```
+
+When the current PPS exceeds this threshold, defense mode activates automatically.
+
+### Managing blacklist and whitelist
+
+Use the [Gateway control plane API reference](/api-reference/gateway-control-plane) to manage XDP lists at runtime:
+
+```bash
+# Block an IP for 10 minutes
+curl -X POST http://localhost:22100/v1/xdp/blacklist \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"ip": "203.0.113.7/32", "ttl_ms": 600000, "reason": "manual"}'
+
+# Add to whitelist
+curl -X POST http://localhost:22100/v1/xdp/whitelist \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"ip": "198.51.100.10/32"}'
+
+# List current blacklist
+curl http://localhost:22100/v1/xdp/blacklist \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Kubernetes note
+
+XDP requires `NET_ADMIN` and `SYS_ADMIN` capabilities plus `privileged: true`. This is incompatible with most managed Kubernetes platforms. The deployment manifest includes the required YAML as comments only.
+
+---
+
+## Rate limiting
+
+Arc has two independent rate limiting systems.
+
+### Per-route rate limiting (GCRA)
+
+The simplest rate limiting is configured directly on a route:
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: app
+    rate_limit:
+      qps: 100
+      burst: 200
+      key:
+        by: client_ip   # or: header (with name), route
+      status: 429
+```
+
+This uses a single-tier GCRA (Generic Cell Rate Algorithm) token bucket stored in the worker thread's local `HashMap`. No cross-thread coordination.
+
+### Two-tier global rate limiting
+
+For cluster-wide enforcement across multiple Arc nodes, the `GlobalRateLimiter` provides a two-tier design:
+
+**L1 (worker-local):** Each worker keeps a `HashMap` of per-key token buckets. No locks on the hot path. `try_acquire` is called inline on every request.
+
+**L2 (Redis backend):** A dedicated backend thread runs Lua scripts against Redis to enforce cluster-wide limits. Workers request token refills asynchronously.
+
+**Circuit breaker:** When the Redis backend is unreachable, the circuit breaker opens and workers fall back to L1-only operation automatically. Default circuit open duration: 500ms.
+
+The hot path on a worker:
+
+1. Drain up to 8 pending refill responses from the backend
+2. Look up or create a per-key `Entry` in local `l1` `HashMap`
+3. If backend is healthy and global tokens remain → consume one global token
+4. If backend healthy but tokens are exhausted → reject with 429
+5. If backend is down → use local L1 token bucket
+6. Schedule a refill if tokens are below the low-watermark
+
+This design ensures worker threads never block waiting for Redis.
+
+---
+
+## L7 protection
+
+Arc applies three L7-level guards on every connection before rate limiting.
+
+### SlowlorisGuard
+
+Detects Slowloris attacks — connections that send HTTP headers extremely slowly to exhaust server connection slots.
+
+| Check | Trigger | Action |
+|---|---|---|
+| Max incomplete per IP | On new connection | Drop if over per-IP limit |
+| Header timeout | Per-byte received | Drop if elapsed > `headers_timeout_ns` |
+| Min receive rate | Per-byte received | Drop if bytes/elapsed < `min_recv_rate_bps` |
+
+### TlsFloodGuard
+
+Limits TLS handshake rate per IP per second. State is stored in a fixed-size array of `AtomicU64` cells — each cell packs `(second << 32) | count`. When the count for the current second exceeds `max_handshakes_per_ip_per_sec`, the connection is rejected.
+
+### H2StreamFloodGuard
+
+Per-connection HTTP/2 protection against stream flood and RST flood attacks.
+
+| Event | Check | Response |
+|---|---|---|
+| `HEADERS` frame (new stream) | `open_streams > max_concurrent_streams` | Send `GOAWAY` |
+| `HEADERS` frame (new stream) | `streams_created_in_window > max_streams_per_sec` | Send `GOAWAY` |
+| `RST_STREAM` received | `rsts_in_window > max_rst_per_sec` | Send `GOAWAY` |
+
+The window resets each second. The worker is responsible for sending the GOAWAY frame.
+
+---
+
+## Request timeouts
+
+Arc tracks per-request deadlines at nanosecond precision without extra timer allocations. Four timeout boundaries are enforced for every request:
+
+| Timeout | When applied |
+|---|---|
+| `connect` | TCP connection establishment to upstream |
+| `response_header` | Time to first byte from upstream after request sent |
+| `per_try` | Maximum duration of a single retry attempt |
+| `total` | Maximum end-to-end request duration |
+
+Each stage deadline is bounded by **all three** applicable limits (stage timeout, per-try deadline, total deadline), so no single operation can exceed the overall request budget.
+
+Configure via upstream `timeouts`:
+
+```yaml
+upstreams:
+  - name: api
+    timeouts:
+      connect: 2s
+      ttfb: 5s       # time-to-first-byte
+      write: 30s
+      read: 30s
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="XDP is not loading (XDP attach failed)">
+XDP requires a network driver that supports XDP (most modern drivers do). Verify with `ip link show <iface>`. The fallback chain tries `native → generic → skb`. If all fail, the gateway starts without XDP and logs a warning. Confirm via `GET /v1/xdp/status`.
+  </Accordion>
+  <Accordion title="IPs are being blocked unexpectedly">
+Check the XDP blacklist: `curl http://localhost:22100/v1/xdp/blacklist`. Dynamic thresholds may have auto-blacklisted a legitimate source during a traffic spike. Remove with `DELETE /v1/xdp/blacklist` and consider increasing `sigma_multiplier` via `POST /v1/xdp/config` (e.g. `{"sigma_multiplier": 5.0}`) to widen the threshold before traffic triggers auto-blacklisting. Check `arc_xdp_blacklisted_total` in `/metrics`.
+  </Accordion>
+  <Accordion title="Rate limiting is not working">
+Ensure `control_plane.enabled: true` and `observability.metrics_bind` is up. Per-route rate limiting uses GCRA locally — no Redis needed. Cluster-wide rate limiting requires a reachable Redis and the `redis` feature compiled in. Check `arc_ratelimit_rejected_total` in `/metrics` to confirm the limiter is active.
+  </Accordion>
+  <Accordion title="SlowlorisGuard is blocking legitimate slow clients">
+The guard triggers on incomplete HTTP headers that linger past `header_timeout`. Increase the threshold in the security config or disable it for specific listener addresses by not enabling L7 protection on internal-only listeners.
+  </Accordion>
+  <Accordion title="Two-tier rate limit circuit breaker is open">
+`arc_ratelimit_circuit_open` will be `1` in metrics. This means the Redis backend is unreachable and Arc has fallen back to L1 (per-worker) rate limiting. Check Redis connectivity and inspect the circuit breaker `open_until_ns` via the control plane.
+  </Accordion>
+</AccordionGroup>
+
+

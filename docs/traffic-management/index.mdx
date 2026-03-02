@@ -1,0 +1,320 @@
+---
+title: "Traffic Management"
+description: "This page covers Arc's routing, traffic mirroring, traffic splitting, and plugin system."
+---
+
+---
+
+## Routing
+
+Arc uses a two-layer routing architecture:
+
+- **Fast path** — an allocation-free radix tree (`arc-router`) maps a raw URL path to a route ID in the hot path.
+- **Full match** — the multi-dimensional router (`arc-core`) evaluates host, method, headers, cookies, and query predicates to select the final route.
+
+### Path patterns
+
+| Pattern | Example | Behavior |
+|---|---|---|
+| Exact literal | `/api/v1/health` | Matches only that exact path |
+| Capture | `/users/{id}/profile` | Captures the `id` segment |
+| Tail capture | `/{*rest}` | Captures the remainder of the path |
+| Wildcard | `/static/*` | Matches any single segment; does not cross `/` |
+| Deep wildcard | `/api/**` | Last-segment deep match |
+
+Query strings and fragments are stripped before matching. Routing is O(log n) and requires no locks.
+
+### Match predicates
+
+Beyond path, routes can match on:
+
+```yaml
+routes:
+  - name: mobile-api
+    match:
+      host: [api.example.com]
+      methods: [GET, POST]
+      path: /v2/{*rest}
+      headers:
+        - op: equals
+          name: X-Client-Type
+          value: mobile
+      cookies:
+        - op: equals
+          name: session_tier
+          value: premium
+      query:
+        - op: exists
+          name: debug
+```
+
+All predicates on a route must match. The first matching route wins.
+
+### Route priority
+
+Routes are evaluated by specificity:
+1. Exact literal paths beat wildcards
+2. Longer patterns beat shorter ones
+3. More specific segment matches beat deeper wildcards
+4. Within the same specificity, declaration order determines the winner
+
+### Request rewriting
+
+Rewrite the URL before forwarding:
+
+```yaml
+action:
+  upstream: api
+  rewrite:
+    pattern: "^/legacy/(.+)$"
+    replace: "/api/v2/$1"
+```
+
+### Header mutations
+
+Add, set, or remove headers on the upstream request:
+
+```yaml
+action:
+  upstream: api
+  headers:
+    - op: set
+      name: X-Forwarded-By
+      value: arc
+    - op: add
+      name: X-Request-Id
+      value: "{request_id}"
+    - op: remove
+      name: X-Internal-Debug
+```
+
+### Redirects
+
+Short-circuit a request with a redirect, without touching the upstream:
+
+```yaml
+action:
+  redirect:
+    status: 301
+    location: "https://example.com/{*rest}"
+```
+
+### Retry policy
+
+Automatically retry failed upstream requests:
+
+```yaml
+action:
+  upstream: api
+  retry:
+    max_retries: 2
+    backoff: 100ms
+    idempotent_only: true   # only retry GET, HEAD, OPTIONS, etc.
+```
+
+---
+
+## Traffic mirroring
+
+Traffic mirroring sends a copy of every request (or a sampled fraction) to a shadow upstream. The main request path is never blocked — mirror tasks are enqueued fire-and-forget.
+
+### Basic mirror
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: prod
+    mirror: api-shadow    # shorthand: upstream name only
+```
+
+### Advanced mirror with sampling and comparison
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: prod
+    mirror:
+      - upstream: api-v2-shadow
+        sample: 0.5          # mirror 50% of requests
+        timeout: 3s          # independent from main request timeout
+        transform:
+          headers:
+            set:
+              X-Shadow: "true"
+              X-Env: staging
+            remove: [X-Real-User, Authorization]
+          path: "/v2$path"   # rewrite the path for the shadow
+        compare:
+          enabled: true
+          ignore_headers: [Date, X-Request-Id]
+          ignore_body_fields: ["$.timestamp", "$.request_id"]
+          on_diff: log
+```
+
+### Global mirror policy
+
+Configure the memory budget for mirror tasks:
+
+```yaml
+defaults:
+  mirror_policy:
+    max_queue_bytes: 52428800   # 50 MB
+    on_upstream_error: discard
+    isolation: strict
+```
+
+When `max_queue_bytes` is exceeded, new mirror tasks are dropped silently. The main request path is unaffected.
+
+### How mirroring works internally
+
+1. After receiving the upstream response, `submit_all` is called with the mirror targets.
+2. For each target: sampling check (lock-free PRNG) → byte reservation (CAS) → non-blocking enqueue.
+3. If the queue mutex is contended, the task is dropped immediately — the caller never blocks.
+4. Worker threads pop tasks and execute them: transform request → open a TCP connection → send and receive → compare if enabled.
+
+Mirror connections always use `Connection: close` to avoid hanging keep-alive connections.
+
+### Metrics
+
+Arc tracks mirror outcomes via Prometheus:
+
+| Metric | Description |
+|---|---|
+| `arc_mirror_submitted_total` | Tasks enqueued |
+| `arc_mirror_sent_total` | Tasks successfully forwarded |
+| `arc_mirror_queue_full_total` | Tasks dropped (queue full) |
+| `arc_mirror_timeout_total` | Tasks dropped (timeout) |
+| `arc_mirror_upstream_error_total` | Tasks dropped (upstream error) |
+| `arc_mirror_status_2xx_total` | Shadow responses by status class |
+| `arc_mirror_latency_sum_ns` | Total shadow response latency |
+
+---
+
+## Traffic splitting
+
+Split traffic across multiple upstreams by weight:
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: api-v1    # default upstream (unused when split is set)
+    split:
+      choices:
+        - upstream: api-v1
+          weight: 90
+        - upstream: api-v2
+          weight: 10
+      key:
+        source: client_ip    # or: header (with name), cookie (with name)
+```
+
+Splitting uses consistent hashing on the configured key, so the same client always goes to the same upstream across requests.
+
+---
+
+## Plugins
+
+Arc supports WASM and Rhai plugins that run at defined stages of the request lifecycle.
+
+### WASM plugins
+
+WASM plugins are compiled WebAssembly modules loaded from disk. Arc uses Wasmtime with epoch-based timeouts to enforce a per-invocation CPU budget:
+
+```yaml
+plugins:
+  wasm:
+    - name: auth-check
+      file: /etc/arc/plugins/auth-check.wasm
+      budget: 2ms
+```
+
+The `on_request` ABI receives the request method and path. The return value determines the outcome:
+
+| Return value | Effect |
+|---|---|
+| `0` | Allow the request to proceed |
+| Any HTTP status code | Reject with that status |
+
+### Rhai scripts
+
+Rhai is a scripting language that runs inline scripts with a configurable operation count limit:
+
+```yaml
+plugins:
+  rhai:
+    - name: add-headers
+      inline: |
+        request.set_header("X-Via", "arc");
+        request.set_header("X-Node", env("NODE_ID"));
+        0
+      max_ops: 50000
+```
+
+### Attaching plugins to routes
+
+Plugins run at the configured pipeline stage:
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: app
+    plugins:
+      - name: auth-check
+        stage: request_headers
+      - name: add-headers
+        stage: request_headers
+```
+
+Multiple plugins on the same route run in declaration order.
+
+**Pipeline stages:**
+
+| Stage | When |
+|---|---|
+| `l4` | Before HTTP parsing, at the TCP level |
+| `request_headers` | After request headers are received (most common) |
+| `request_body` | After request body is buffered |
+| `response_headers` | After upstream response headers arrive |
+| `response_body` | After response body is received |
+| `log` | At access log emission time |
+
+### Plugin isolation
+
+Each worker has its own Wasmtime instance pool. Plugin instances are not shared across workers. If a WASM module exceeds its `budget`, the invocation is interrupted and the request is rejected with 500. Panics inside plugins are caught and counted.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Route is not matching when expected">
+Arc evaluates routes by specificity: exact path wins over wildcard; longer patterns win over shorter. If two routes both match, the more specific one wins. Add a `name` to each route and check `arc_route_requests_total{route="..."}` in `/metrics` to see which route is actually matching. Use `GET /v1/config` on the control plane to inspect the compiled route order.
+  </Accordion>
+  <Accordion title="Path parameters are not being extracted">
+Ensure the path pattern uses `{param}` syntax (e.g., `/users/{id}`). The captured value is available as `$param` in rewrite rules. Wildcard `*` does not capture — use `{*rest}` for tail capture.
+  </Accordion>
+  <Accordion title="Rate limit is triggering too aggressively">
+Check the `key` field in `rate_limit`. The default `client_ip` means each client IP gets its own bucket. If you need a global limit across all clients, use `key: { by: route }` (inline) or the multi-line form `key:\n  by: route`. Adjust `burst` to allow short traffic spikes.
+  </Accordion>
+  <Accordion title="Traffic mirror is dropping requests">
+Check `arc_mirror_queue_full_total` in `/metrics`. If this is incrementing, the in-memory mirror queue (`max_queue_bytes`, default 50 MB) is full. Reduce mirror `sample` rate or increase `max_queue_bytes`. If `arc_mirror_upstream_error_total` is incrementing, the mirror upstream is unreachable.
+  </Accordion>
+  <Accordion title="Traffic split is not distributing as expected">
+Weights are relative, not percentages. `[{upstream: a, weight: 1}, {upstream: b, weight: 3}]` means 25% to `a` and 75% to `b`. The splitter uses a per-worker PRNG — distribution converges over many requests but may appear uneven on small samples.
+  </Accordion>
+  <Accordion title="WASM plugin is timing out">
+Each WASM plugin execution is bounded by `budget`. Increase the budget in `plugins.wasm[].budget` if the plugin legitimately needs more time. Check `arc_plugin_timeout_total` in `/metrics` to confirm timeouts are occurring.
+  </Accordion>
+</AccordionGroup>
+
+

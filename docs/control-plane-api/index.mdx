@@ -1,0 +1,108 @@
+---
+title: "Control Plane API"
+description: "The Control Plane API is Arc's management interface. It runs as a separate HTTP server on a dedicated thread, completely isolated from the io_uring data-plane workers."
+---
+
+## Configuration
+
+```yaml
+control_plane:
+  enabled: true           # default is false — must explicitly enable
+  bind: "127.0.0.1:22100" # default
+  auth_token: "your-secret-token"
+  role: standalone    # standalone | leader | follower
+```
+
+All `control_plane` fields require a process restart to change.
+
+## Authentication
+
+Every request must be authenticated:
+
+- **With `auth_token`:** Send `Authorization: Bearer <token>` from any IP. Comparison is constant-time.
+- **Without `auth_token`:** Requests must originate from a loopback address (`127.0.0.1` or `::1`). No header required.
+
+Unauthorized requests receive `401 Unauthorized`.
+
+## Node roles
+
+| Role | Behavior |
+|---|---|
+| `standalone` | Applies config locally only |
+| `leader` | Can push config to peers via `/v1/cluster/config` |
+| `follower` | Long-polls a leader for config updates |
+
+## Common response codes
+
+| Status | Meaning |
+|---|---|
+| `200` | Success |
+| `304` | Not Modified (config unchanged, ETag/long-poll) |
+| `400` | Bad request (JSON parse or compile error) |
+| `401` | Unauthorized |
+| `403` | Forbidden (e.g. cluster push on non-leader) |
+| `404` | Unknown endpoint |
+| `409` | Config valid but requires process restart for listed fields |
+| `503` | Required subsystem not running (gossip, XDP, or quorum not met) |
+
+<CardGroup cols={2}>
+  <Card title="Gateway control plane API" icon="server" href="/api-reference/gateway-control-plane">
+    Runtime API for config, cluster, and XDP endpoints.
+  </Card>
+  <Card title="Daemon control plane API" icon="cpu" href="/api-reference/daemon-control-plane">
+    API for daemon lifecycle and control operations.
+  </Card>
+  <Card title="Observability API" icon="chart-line" href="/api-reference/observability">
+    API surface related to metrics and observability.
+  </Card>
+</CardGroup>
+
+## Follower configuration
+
+When `role: follower`, Arc automatically polls a leader for config changes:
+
+```yaml
+control_plane:
+  role: follower
+  pull_from: "http://arc-leader:22100"
+  longpoll_timeout_ms: 30000
+```
+
+The follower issues `GET /v1/config/longpoll?since=<generation>` against the leader. When the config changes, the leader responds immediately. On timeout (30s), the follower re-issues. On network error, it backs off and retries.
+
+---
+
+## Audit logging
+
+Every config change event (validate, apply, or reject) is written to the structured log with:
+
+- Operation name (`api`, `api_validate`, `cluster_api`)
+- Peer address
+- Outcome (`applied`, `rejected_restart_required`, `rejected_quorum`)
+- Old and new generation numbers
+- Diff summary
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="401 Unauthorized on every request">
+If `auth_token` is set, include `Authorization: Bearer <token>` in every request. If `auth_token` is not set, the control plane only accepts connections from loopback (`127.0.0.1` or `::1`). Verify the control plane is bound to the correct address.
+  </Accordion>
+  <Accordion title="POST /v1/cluster/config returns 503">
+The node is not in `leader` role. Only leaders can push cluster config. Verify `control_plane.role: leader` in config. If the node is a follower, push config to the leader instead.
+  </Accordion>
+  <Accordion title="Cluster config commit returns partial success">
+The `committed` and `failed` arrays in the response show which peers succeeded. Failed peers will pick up the config on their next long-poll cycle or gossip round. If `committed` is less than `quorum`, the entire commit is rejected and no nodes apply the new config.
+  </Accordion>
+  <Accordion title="Long-poll times out immediately">
+Check that `since` is set to the current generation number. If `since` is less than the current generation, the server returns `200` immediately with the current config. Use `GET /v1/config` first to get the current `X-Config-Generation` header, then pass that as `since`.
+  </Accordion>
+  <Accordion title="XDP endpoints return 503">
+XDP was not initialized — either the kernel does not support it, the interface does not support native XDP, or the XDP config block is absent. Check `GET /v1/xdp/status` first. If the endpoint itself returns 503, XDP is not running.
+  </Accordion>
+  <Accordion title="Gossip endpoints return 503">
+Gossip is not enabled. The control plane requires `gossip` configuration to be present. If you only need leader/follower replication without gossip, use `pull_from` with long-poll instead.
+  </Accordion>
+</AccordionGroup>
+
+

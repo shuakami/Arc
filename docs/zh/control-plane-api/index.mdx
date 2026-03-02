@@ -1,0 +1,106 @@
+---
+title: "控制面 API"
+description: "Control Plane API 是 Arc 的管理接口。它运行在独立的 HTTP 服务线程上，与 io_uring 数据平面 worker 完全隔离。"
+---
+
+## 配置项
+
+```yaml
+control_plane:
+  enabled: true           # 默认 false，需要显式开启
+  bind: "127.0.0.1:22100" # 默认地址
+  auth_token: "your-secret-token"
+  role: standalone    # standalone | leader | follower
+```
+
+`control_plane` 下所有字段变更都需要重启进程生效。
+
+## 鉴权
+
+所有请求都必须经过鉴权：
+
+- **配置了 `auth_token`：** 任何来源 IP 都必须发送 `Authorization: Bearer <token>`，并使用常量时间比较。
+- **未配置 `auth_token`：** 仅允许来自回环地址（`127.0.0.1` 或 `::1`）的请求，不需要鉴权头。
+
+未授权请求会返回 `401 Unauthorized`。
+
+## 节点角色
+
+| 角色 | 行为 |
+|---|---|
+| `standalone` | 仅在本节点应用配置 |
+| `leader` | 可通过 `/v1/cluster/config` 向集群节点下发配置 |
+| `follower` | 长轮询 leader 拉取配置 |
+
+## 常见响应码
+
+| 状态码 | 含义 |
+|---|---|
+| `200` | 成功 |
+| `304` | 配置未变化（ETag/长轮询场景） |
+| `400` | 错误请求（JSON 解析或编译失败） |
+| `401` | 未授权 |
+| `403` | 禁止访问（例如非 leader 调用集群下发） |
+| `404` | 未知端点 |
+| `409` | 配置合法但包含需重启字段 |
+| `503` | 必要子系统未运行（gossip、XDP 或 quorum 不满足） |
+
+<CardGroup cols={2}>
+  <Card title="网关控制面 API" icon="server" href="/zh/api-reference/gateway-control-plane">
+    查看配置、集群与 XDP 相关运行时接口。
+  </Card>
+  <Card title="守护进程控制面 API" icon="cpu" href="/zh/api-reference/daemon-control-plane">
+    查看 daemon 生命周期和控制操作接口。
+  </Card>
+  <Card title="可观测性 API" icon="chart-line" href="/zh/api-reference/observability">
+    查看指标与可观测性相关接口。
+  </Card>
+</CardGroup>
+
+## Follower 配置
+
+当 `role: follower` 时，Arc 会自动从 leader 拉取配置更新：
+
+```yaml
+control_plane:
+  role: follower
+  pull_from: "http://arc-leader:22100"
+  longpoll_timeout_ms: 30000
+```
+
+follower 会向 leader 发起 `GET /v1/config/longpoll?since=<generation>`。当配置变更时，leader 会立即返回；超时（30 秒）则重新发起请求；网络错误时会退避重试。
+
+---
+
+## 审计日志
+
+每次配置变更事件（验证、应用、拒绝）都会写入结构化日志，包含：
+
+- 操作名称（`api`、`api_validate`、`cluster_api`）
+- 对端地址
+- 结果（`applied`、`rejected_restart_required`、`rejected_quorum`）
+- 旧 generation 与新 generation
+- 配置差异摘要
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="所有请求都返回 401 Unauthorized">
+如果配置了 `auth_token`，每个请求都要带 `Authorization: Bearer <token>`。如果未配置 `auth_token`，控制面只接受回环地址（`127.0.0.1`、`::1`）请求。请确认 control plane 的绑定地址符合你的访问方式。
+  </Accordion>
+  <Accordion title="POST /v1/cluster/config 返回 503">
+说明当前节点不是 `leader` 角色。只有 leader 可以执行集群配置下发。请检查 `control_plane.role: leader`。如果当前节点是 follower，请把请求发给 leader。
+  </Accordion>
+  <Accordion title="集群配置提交出现部分成功">
+响应中的 `committed` 和 `failed` 会给出各节点结果。失败节点会在下一次长轮询或 gossip 同步时追上。如果 `committed` 小于 `quorum`，整次提交会被拒绝，且不会有节点应用新配置。
+  </Accordion>
+  <Accordion title="长轮询总是立刻超时或立刻返回">
+请确认 `since` 使用的是当前 generation。如果 `since` 小于当前 generation，服务端会立即返回 `200` 和当前配置。建议先调用 `GET /v1/config`，读取 `X-Config-Generation`，再把它作为 `since`。
+  </Accordion>
+  <Accordion title="XDP 相关端点返回 503">
+说明 XDP 没有初始化成功，可能是内核不支持、网卡不支持原生 XDP，或配置里没启用 XDP。可先调用 `GET /v1/xdp/status` 判断运行状态。
+  </Accordion>
+  <Accordion title="Gossip 相关端点返回 503">
+说明 gossip 未启用。控制面这部分能力依赖 `gossip` 配置。如果你只需要 leader/follower 同步，可用 `pull_from` + 长轮询模式。
+  </Accordion>
+</AccordionGroup>

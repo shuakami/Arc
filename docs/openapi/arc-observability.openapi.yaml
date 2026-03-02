@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info:
+  title: Arc Observability Admin API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    OpenAPI for admin observability endpoints implemented in `crates/arc-observability/src/lib.rs`.
+
+    Authentication behavior:
+    - If an admin auth token is configured, send `Authorization: Bearer <token>`.
+    - If no token is configured, only loopback clients are accepted.
+servers:
+  - url: http://127.0.0.1:9090
+security:
+  - bearerAuth: []
+  - {}
+paths:
+  /metrics:
+    get:
+      operationId: getPrometheusMetrics
+      summary: Get Prometheus metrics text
+      responses:
+        '200':
+          description: Prometheus exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          description: Unauthorized
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: "unauthorized\n"
+
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Get health status
+      responses:
+        '200':
+          description: Healthy
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: "ok\n"
+        '401':
+          description: Unauthorized
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: "unauthorized\n"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+

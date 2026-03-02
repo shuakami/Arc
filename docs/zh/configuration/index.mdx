@@ -1,0 +1,647 @@
+---
+title: "配置参考"
+description: "Arc 支持 **YAML**、**JSON**、**TOML** 三种配置格式，通过文件后缀（`.yaml`、`.yml`、`.json`、`.toml`）自动识别。Arc 内部会统一标准化为 canonical JSON。"
+---
+
+未知字段会直接触发反序列化错误，因为全局启用了 `#[serde(deny_unknown_fields)]`。时间字段使用 [humantime](https://docs.rs/humantime) 格式，例如 `"30s"`、`"500ms"`、`"2m"`。
+
+## 顶层结构
+
+```yaml
+io_uring:       # io_uring ring 尺寸与 SQPOLL（变更需重启）
+node:           # 运行时容量参数
+listeners:      # 监听地址与协议
+upstreams:      # 命名上游组
+routes:         # 请求路由规则
+plugins:        # WASM 与 Rhai 插件注册
+observability:  # 指标服务
+logging:        # 访问日志输出、采样、脱敏
+control_plane:  # 节点本地管理 API
+```
+
+---
+
+## `node`
+
+用于控制 worker 数、连接上限和全局 I/O 超时。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `id` | string | `"arc-node"` | 人类可读的节点标识 |
+| `workers` | integer | `0` | 数据平面 worker 线程数，`0` 表示自动识别 CPU 数 |
+| `max_connections` | integer | `0` | 接受 TCP 连接的硬上限，`0` 表示不限 |
+| `read_timeout` | duration | `30s` | 下游读取超时 |
+| `write_timeout` | duration | `30s` | 下游写入超时 |
+| `idle_timeout` | duration | `60s` | keep-alive 空闲超时 |
+
+```yaml
+node:
+  id: "arc-prod-1"
+  workers: 0
+  max_connections: 100000
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 60s
+```
+
+---
+
+## `io_uring`
+
+控制每个 worker 线程的 io_uring 参数。该段全部字段变更都需要重启进程。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `uring_entries` | integer | `2048` | 提交队列 ring 大小（2 的幂）。如果 `arc_ring_sq_dropped_total` 非 0，建议增大。 |
+| `sqpoll` | boolean | `false` | 开启 SQPOLL（内核轮询线程），减少提交 syscall。内核 < 5.11 时需要 `CAP_SYS_ADMIN`。裸机推荐开启。 |
+| `sqpoll_idle_ms` | integer | `2000` | SQPOLL 线程空闲多久后进入休眠（毫秒）。 |
+
+<Note>
+如果 `arc_ring_sq_dropped_total` 或 `arc_ring_cq_overflow_total` 非 0，通常说明 ring 太小，建议将 `uring_entries` 翻倍。
+</Note>
+
+```yaml
+io_uring:
+  uring_entries: 4096   # 高流量节点可设为 4096
+  sqpoll: true          # 裸机推荐
+  sqpoll_idle_ms: 2000
+```
+
+---
+
+## `listeners`
+
+监听器是一个数组，每个元素绑定一个地址。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 监听器标识，ACME 配置会引用 |
+| `kind` | string | 是 | 协议类型（见下表） |
+| `bind` | string | 是 | 监听地址，例如 `"0.0.0.0:443"` |
+| `socket` | object | 否 | 操作系统 socket 调优 |
+| `tls` | object | 否 | `https` / `h3` 场景必需 |
+
+**`kind` 可选值：**
+
+| 值 | 说明 |
+|---|---|
+| `http` | 明文 HTTP/1.1 + H2C |
+| `https` | TLS 上的 HTTP（ALPN：HTTP/1.1 + HTTP/2），需要 `tls` |
+| `h3` | QUIC 上的 HTTP/3，需要 `tls` |
+| `tcp` | 原始 TCP 四层代理 |
+| `udp` | 原始 UDP 四层代理 |
+
+**`socket` 可选项：**
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `so_reuseport` | boolean | `false` | 开启 `SO_REUSEPORT` |
+| `tcp_fastopen_backlog` | integer | null | 开启 TCP Fast Open |
+| `dscp` | integer | null | QoS 的 DSCP/TOS 值 |
+| `keepalive` | object | null | TCP keepalive 探测（`idle`、`interval`、`count`） |
+
+```yaml
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:8080"
+    socket:
+      so_reuseport: true
+
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      certificates:
+        - sni: "example.com"
+          cert_pem: "./certs/example.com.crt"
+          key_pem: "./certs/example.com.key"
+```
+
+### `tls`
+
+仅在监听器 `kind` 为 `https` 或 `h3` 时生效。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `acme` | object | null | ACME 自动证书管理 |
+| `certificates` | array | `[]` | 启动时加载的静态证书 |
+| `min_version` | string | null | `tls12` 或 `tls13` |
+| `max_version` | string | null | TLS 最高版本 |
+| `cipher_suites` | string[] | `[]` | 密码套件优先级（空表示 Rustls 默认） |
+| `session_resumption` | boolean | `true` | 是否启用会话恢复 |
+
+**`certificates` 元素字段：**
+
+| 字段 | 说明 |
+|---|---|
+| `sni` | 主机名，支持精确匹配或通配符（`"*.example.com"`） |
+| `cert_pem` | PEM 证书链路径 |
+| `key_pem` | PEM 私钥路径 |
+
+数组第一张证书会作为未命中 SNI 的兜底证书。
+
+### `tls.acme`
+
+用于从 ACME CA 自动签发并续期证书。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `email` | string | null | ACME 账号联系邮箱 |
+| `directory_url` | string | Let's Encrypt | ACME 目录地址 |
+| `account_key` | object | required | 账号密钥配置 |
+| `domains` | string[] | required | 要签发证书的域名列表 |
+| `challenge` | object | required | 挑战类型 |
+| `renew_before` | duration | `720h` | 提前续期时间窗口 |
+
+**`account_key` 字段：**
+
+| 字段 | 说明 |
+|---|---|
+| `algorithm` | `ed25519` 或 `rsa2048` |
+| `encrypted_key_path` | 加密密钥文件路径 |
+| `passphrase` | `{ type: env, name: VAR }` 或 `{ type: file, path: /path }` |
+
+**`challenge` 类型：**
+
+| `type` | 额外字段 | 说明 |
+|---|---|---|
+| `http_01` | `listener` | 通过指定监听器做 HTTP-01（必须绑定 80） |
+| `tls_alpn_01` | `listener` | 通过 TLS 监听器做 TLS-ALPN-01 |
+| `dns_01` | `provider` | DNS-01，可接 Cloudflare、Route53、RFC2136、webhook、hook |
+
+完整 ACME 示例：
+
+```yaml
+tls:
+  acme:
+    email: you@example.com
+    domains: [example.com, www.example.com]
+    account_key:
+      algorithm: ed25519
+      encrypted_key_path: /etc/arc/acme-key.enc
+      passphrase:
+        type: env
+        name: ACME_KEY_PASSPHRASE
+    challenge:
+      type: tls_alpn_01
+      listener: https
+    renew_before: 720h
+```
+
+---
+
+## `upstreams`
+
+这是命名上游组数组，路由通过 `name` 引用上游。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `name` | string | required | 路由动作中引用的上游名 |
+| `discovery` | object | required | 上游地址发现方式 |
+| `lb` | object | `peak_ewma` | 负载均衡算法 |
+| `health` | object | (empty) | 主动与被动健康检查 |
+| `pool` | object | 见下文 | 连接池参数 |
+| `timeouts` | object | 见下文 | 上游超时覆盖参数 |
+
+### `discovery`
+
+**静态地址：**
+
+```yaml
+discovery:
+  type: static
+  endpoints:
+    - address: "10.0.0.1:3000"
+      weight: 1
+    - address: "10.0.0.2:3000"
+      weight: 2
+```
+
+**DNS 发现：**
+
+```yaml
+discovery:
+  type: dns
+  hostname: api.internal
+  port: 3000
+  respect_ttl: true
+  fallback_poll: 10s
+```
+
+### `lb`（负载均衡）
+
+| `algorithm` | 额外字段 | 说明 |
+|---|---|---|
+| `round_robin` | — | 均匀轮询 |
+| `weighted_round_robin` | — | 按 `endpoint.weight` 加权轮询 |
+| `least_requests` | — | 选择在途请求最少的节点 |
+| `consistent_hash` | `key`, `virtual_nodes` | Ketama 一致性哈希 |
+| `peak_ewma` | `decay`（duration） | 基于延迟的 Peak EWMA 选择 |
+
+一致性哈希 key 来源可以是 `client_ip`、`header`（需 `name`）或 `cookie`（需 `name`）。
+
+### `health`
+
+**主动健康检查：**
+
+```yaml
+health:
+  active:
+    interval: 10s
+    path: /health
+    fail_after: 3
+    pass_after: 2
+```
+
+**被动健康检查：**
+
+```yaml
+health:
+  passive:
+    error_rate_threshold: 0.2
+    window: 30s
+    ejection_time: 60s
+```
+
+### `pool`（连接池）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `max_idle` | `1024` | 每个上游最大空闲连接数 |
+| `idle_ttl` | `30s` | 超过该时长的空闲连接会被回收 |
+| `max_lifetime` | `300s` | 单连接最大生命周期 |
+
+### `timeouts`（上游超时）
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `connect` | `2s` | 上游 TCP 建连超时 |
+| `write` | `30s` | 写请求到上游超时 |
+| `ttfb` | `5s` | 发出请求后等待首字节超时 |
+| `read` | `30s` | 读取完整响应超时 |
+
+### `tls`（上游 TLS）
+
+可选。配置后 Arc 会与上游建立 TLS 连接。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `ca_pem` | null | 用于校验上游证书的 CA 文件路径 |
+| `client_cert_pem` | null | 客户端证书路径（双向 TLS） |
+| `client_key_pem` | null | 客户端私钥路径（双向 TLS） |
+| `insecure` | `false` | 跳过上游证书校验，仅建议开发环境使用 |
+
+完整上游 TLS 示例见 [TLS 与证书](/zh/tls-and-certificates)。
+
+---
+
+## `routes`
+
+路由规则为数组。匹配优先级遵循“更具体优先”：精确路径优先于通配路径，长路径优先于短路径。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `name` | string | required | 路由名（用于日志与插件） |
+| `match` | object | required | 匹配条件 |
+| `action` | object | required | 命中后的动作 |
+| `rate_limit` | object | null | 路由级限流 |
+| `mirror` | object | null | 流量镜像 |
+| `split` | object | null | 加权分流 |
+| `plugins` | array | `[]` | 该路由绑定的插件 |
+
+### `match`
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `host` | `[]` | 主机名列表，空表示不限 |
+| `methods` | `[]` | HTTP 方法列表，空表示不限 |
+| `path` | required | 路径模式 |
+| `headers` | `[]` | Header 谓词（全部满足） |
+| `cookies` | `[]` | Cookie 谓词 |
+| `query` | `[]` | Query 参数谓词 |
+| `expr` | null | 组合命名匹配器的布尔表达式（AND/OR/NOT） |
+
+**路径模式：**
+
+| 模式 | 示例 | 行为 |
+|---|---|---|
+| 精确匹配 | `/api/v1/users` | 仅命中完全相同路径 |
+| 段捕获 | `/users/{id}` | 捕获单个路径段 |
+| 尾部捕获 | `/{*rest}` | 捕获后续全部路径 |
+| 通配段 | `/static/*` | 匹配单段通配 |
+
+Header 谓词 `op` 可选：`exists`、`contains`、`regex`、`equals`。全部操作都需要 `name`；值比较类操作还需要 `value` 或 `pattern`。
+
+### `action`
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `upstream` | required | 上游组名称 |
+| `rewrite` | null | URL 重写（`pattern` + `replace`） |
+| `headers` | `[]` | 转发前 Header 变更 |
+| `redirect` | null | 直接重定向（`status` + `location`） |
+| `retry` | 见下文 | 重试策略 |
+
+Header 变更操作 `op`：`add`、`set`、`remove`。
+
+**`retry` 字段：**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `max_retries` | `1` | 最大重试次数 |
+| `backoff` | `50ms` | 重试固定退避时间 |
+| `idempotent_only` | `true` | 仅重试 GET/HEAD/OPTIONS 等幂等请求 |
+
+### `rate_limit`
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `qps` | required | 令牌补充速率 |
+| `burst` | required | 桶容量（最大突发） |
+| `key` | `client_ip` | 限流 key 生成策略 |
+| `status` | `429` | 超限响应状态码 |
+
+`key` 策略可选：`client_ip`、`header`（需 `name`）或 `route`（全路由共享桶）。
+
+### `mirror`
+
+```yaml
+# 简写
+mirror: api-shadow
+
+# 完整写法
+mirror:
+  - upstream: api-v2-shadow
+    sample: 0.5
+    timeout: 3s
+    transform:
+      headers:
+        set: { X-Shadow: "true" }
+        remove: [X-Real-User]
+      path: "/v2$path"
+    compare:
+      enabled: true
+      ignore_headers: [Date]
+      ignore_body_fields: ["$.timestamp"]
+      on_diff: log
+```
+
+### `split`（流量分流）
+
+```yaml
+split:
+  choices:
+    - upstream: app-v1
+      weight: 90
+    - upstream: app-v2
+      weight: 10
+  key:
+    source: client_ip
+```
+
+---
+
+## `plugins`
+
+全局插件注册区。路由通过名字引用插件。
+
+```yaml
+plugins:
+  wasm:
+    - name: my-filter
+      file: ./plugins/my-filter.wasm
+      budget: 2ms
+
+  rhai:
+    - name: add-header
+      inline: |
+        request.set_header("X-Via", "arc");
+        0
+      max_ops: 50000
+```
+
+### WASM 插件字段
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `name` | required | 插件标识 |
+| `file` | required | `.wasm` 文件路径 |
+| `budget` | `2ms` | 单次调用 CPU 预算 |
+
+### Rhai 脚本字段
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `name` | required | 脚本标识 |
+| `inline` | required | 内联 Rhai 代码 |
+| `max_ops` | `50000` | 单次调用操作上限 |
+
+### 把插件绑定到路由
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: app
+    plugins:
+      - name: my-filter
+        stage: request_headers
+```
+
+**`stage` 可选值：**
+
+| 值 | 说明 |
+|---|---|
+| `l4` | L4/TCP 层，HTTP 解析前 |
+| `request_headers` | 收到请求头后 |
+| `request_body` | 请求体缓冲完成后 |
+| `response_headers` | 上游响应头到达后 |
+| `response_body` | 响应体接收完成后 |
+| `log` | 写访问日志时 |
+
+---
+
+## `observability`
+
+控制指标与管理端点。访问日志配置在下文 `logging`。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `metrics_bind` | `"127.0.0.1:9090"` | Prometheus `/metrics` 绑定地址 |
+| `metrics_enabled` | `true` | 是否开启指标端点 |
+| `tracing` | null | OTLP 追踪导出（`endpoint`、`insecure`） |
+
+```yaml
+observability:
+  metrics_bind: "0.0.0.0:9090"   # 暴露到所有网卡（建议配防火墙）
+  metrics_enabled: true
+  tracing:
+    endpoint: "http://otel-collector:4317"
+    insecure: true
+```
+
+---
+
+## `logging`
+
+控制结构化 NDJSON 访问日志。`logging` 是顶层字段，和 `observability` 分离。
+
+**`logging.output`：**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `logging.output.file` | `/var/log/arc/access.log` | 日志输出文件 |
+| `logging.output.stdout` | `false` | 是否同时输出到 stdout |
+| `logging.output.rotation.max_size` | `500mb` | 文件达到该体积后轮转 |
+| `logging.output.rotation.max_files` | `30` | 保留轮转文件数量 |
+| `logging.output.rotation.compress` | `true` | 是否 gzip 压缩轮转文件 |
+
+**`logging.access`：**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `logging.access.sample` | `0.01` | 请求采样比例（0.0–1.0），主采样开关 |
+| `logging.access.force_on_status` | `[401,403,429,500,502,503,504]` | 无论采样比例，命中这些状态码都强制记录 |
+| `logging.access.force_on_slow` | `500` | 无论采样比例，耗时超过该毫秒值都强制记录 |
+
+> `observability.access_log.sample`（默认 `1.0`）和 `logging.access.sample`（默认 `0.01`）是两个独立字段。前者是旧参数，后者会覆盖前者。新配置建议统一使用 `logging.access.sample`。
+
+**`logging.redact`：**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `logging.redact.headers` | `["Authorization","Cookie",…]` | 命中后替换为 `[REDACTED]` |
+| `logging.redact.query_params` | `["token","secret",…]` | 命中后替换为 `[REDACTED]` |
+
+**`logging.writer`：**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `logging.writer.ring_capacity` | `8192` | 每 worker 的 SPSC ring 大小（条目数） |
+| `logging.writer.batch_bytes` | `262144` | 批次达到该大小时触发刷盘（字节） |
+| `logging.writer.flush_interval` | `50` | 定时刷盘间隔（毫秒） |
+
+```yaml
+logging:
+  output:
+    file: /var/log/arc/access.log
+    stdout: false
+    rotation:
+      max_size: 500mb
+      max_files: 30
+      compress: true
+  access:
+    sample: 0.01
+    force_on_status: [401, 403, 429, 500, 502, 503, 504]
+    force_on_slow: 500
+  redact:
+    headers: [Authorization, Cookie, X-Api-Key]
+    query_params: [token, secret, password]
+```
+
+---
+
+## `control_plane`
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 总开关。不开启则控制面服务不会启动 |
+| `bind` | `"127.0.0.1:22100"` | 控制面 HTTP 服务监听地址 |
+| `role` | `standalone` | `standalone`、`leader`、`follower` |
+| `node_id` | hostname | 集群 gossip 的唯一节点名 |
+| `peers` | `[]` | leader 发起 HTTP 推送时的 peer URL 列表 |
+| `quorum` | `0` | 提交前最少成功节点数，`0` 表示多数派 |
+| `auth_token` | null | Bearer token；`null` 表示仅回环可访问 |
+| `pull_from` | null | follower 拉取配置的 leader URL |
+| `longpoll_timeout_ms` | `30000` | 长轮询服务端挂起时长 |
+| `peer_timeout_ms` | `5000` | 节点间 validate/commit 请求超时 |
+| `peer_concurrency` | `16` | 集群下发时并行 peer 请求上限 |
+| `runtime_threads` | `2` | control plane runtime 的 Tokio 线程数 |
+| `compile_threads` | `2` | JSON 编译 `spawn_blocking` 线程上限 |
+| `max_body_bytes` | `16 MiB` | 配置端点请求体大小上限 |
+
+`control_plane` 下所有字段变更都需要重启进程。
+
+接口说明见 [网关控制面 API 参考](/zh/api-reference/gateway-control-plane)。
+
+---
+
+## 完整示例
+
+```yaml
+node:
+  id: "prod-1"
+  workers: 0
+  max_connections: 100000
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 60s
+
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:8080"
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      certificates:
+        - sni: "*.example.com"
+          cert_pem: /etc/arc/certs/wildcard.crt
+          key_pem: /etc/arc/certs/wildcard.key
+
+upstreams:
+  - name: api
+    discovery:
+      type: static
+      endpoints:
+        - address: "10.0.1.1:3000"
+        - address: "10.0.1.2:3000"
+    lb:
+      algorithm: peak_ewma
+      decay: 10s
+    health:
+      active:
+        interval: 10s
+        path: /health
+    pool:
+      max_idle: 512
+      idle_ttl: 30s
+    timeouts:
+      connect: 2s
+      ttfb: 5s
+
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+      methods: [GET, POST, PUT, DELETE]
+    action:
+      upstream: api
+      retry:
+        max_retries: 2
+        backoff: 100ms
+        idempotent_only: true
+    rate_limit:
+      qps: 1000
+      burst: 2000
+      key:
+        by: client_ip
+
+  - name: root
+    match:
+      path: /{*rest}
+    action:
+      upstream: api
+
+observability:
+  metrics_bind: "127.0.0.1:9090"
+
+control_plane:
+  enabled: true
+  bind: "127.0.0.1:22100"
+  auth_token: "your-secret-token"
+```

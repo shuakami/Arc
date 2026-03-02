@@ -1,0 +1,158 @@
+---
+title: "架构"
+description: "Arc 的架构建立在两个核心原则上：按核线程（thread-per-core）和 io_uring。几乎所有设计选择都围绕这两点展开。"
+---
+
+## 按核线程模型
+
+每个 worker 线程绑定一个 CPU 核，并各自打开 `SO_REUSEPORT` 监听 socket。内核会把新连接自动分发到各个 worker。在请求处理过程中，worker 之间不会共享可变状态。
+
+**每个 worker 独占的资源：**
+
+| 资源 | 类型 |
+|---|---|
+| io_uring ring | `Uring` 结构（arc-net） |
+| 固定缓冲池 | `FixedBuffers`（arc-net） |
+| 连接槽位表 | 由 `ConnId` 索引（arc-gateway） |
+| 上游连接池 | `UpstreamPool`（arc-gateway） |
+| 插件实例池 | 每池 `PluginCatalog`（arc-plugins） |
+| 一级限流缓存 | `WorkerLimiter`（arc-global-rate-limit） |
+| 指标计数器 | `WorkerMetrics`（arc-observability） |
+| 日志 ring buffer | SPSC ring（arc-logging） |
+
+**worker 之间共享（只读或原子）的资源：**
+
+| 资源 | 机制 |
+|---|---|
+| 路由、上游、插件、限流器 | `ArcSwap<Arc<SharedConfig>>`，请求周期内通过 acquire load 获取 |
+| 指标数组 | `AtomicU64` 计数；管理线程用 relaxed ordering 读取 |
+| 全局限流后端 | `GlobalRateLimiter` + L2 Redis；worker 异步请求补令牌 |
+| XDP BPF map | 由内核管理；用户态 `XdpManager` 通过 libbpf 写入 |
+
+## io_uring 数据平面
+
+Arc 直接使用 Linux io_uring，而不是 epoll 或 Tokio 一类 async runtime。这样可以减少每次 I/O 操作的 syscall 开销。Arc 重点使用的 io_uring 特性包括：
+
+- **SQPOLL**：内核轮询线程直接消费提交队列，用户态无需为提交再发 syscall
+- **Fixed buffers**：预注册缓冲池；读写时使用缓冲区索引而非指针
+- **Fixed files**：预注册 fd 集合，减少 fd 表查找开销
+- **Multishot accept**：单个 `accept` SQE 在每次接入后自动重臂，不必反复提交
+- **Multishot timeout**：单个 timeout SQE 覆盖连接槽定时轮
+
+## 共享配置与热更新
+
+所有 worker 共享一个 `ArcSwap<Arc<SharedConfig>>`。`SharedConfig` 内含已编译路由、已编译上游、插件目录、按路由限流器和 TLS 状态。构建完成后即不可变。
+
+热更新流程如下：
+
+```
+Config file
+    │ mtime change
+    ▼
+Background watcher thread
+    │ compile_config() → SharedConfig
+    ▼
+ArcSwap::store() (release-store)
+    │
+    ├── Worker 0: ArcSwap::load() (acquire)
+    ├── Worker 1: ArcSwap::load() (acquire)
+    └── Worker N: ArcSwap::load() (acquire)
+```
+
+监听地址、worker 数、io_uring ring 尺寸、control plane 绑定地址等字段会被 `restart_required_changes()` 判定为“需重启字段”。只要这些字段有变化，热更新会被拒绝。
+
+Arc 内部会把 TOML/YAML/JSON 统一标准化为 canonical JSON。具体做法是先解析为 `serde_json::Value`，再做 key 排序，最终写入 `SharedConfig` 的 `raw_json: Arc<str>`。这样可以保证集群节点之间的配置指纹一致且可复现。
+
+## 请求处理路径
+
+```
+Kernel (io_uring CQE: accept or read)
+    │
+Worker::run()
+    │
+    ├── Router::match() — host, method, path, headers
+    │       └── MatchResult or 404
+    │
+    ├── Limiter::try_acquire() — per-route token check
+    │
+    ├── PluginCatalog::invoke() — on_request() → 0=allow / status=deny
+    │
+    ├── UpstreamPool — checkout or connect
+    │
+    ├── io_uring write SQE (fixed buffer → upstream fd)
+    │
+    ├── io_uring read CQE (upstream response)
+    │
+    ├── io_uring write SQE (fixed buffer → client fd)
+    │
+    ├── WorkerMetrics — phase_count.fetch_add
+    │
+    └── AccessLogContext — emit AccessLogRecord
+```
+
+## 安全分层
+
+Arc 把安全能力拆为三层，并且互相独立：
+
+```
+Internet traffic
+    │
+    ▼
+arc-xdp kernel program (XDP hook, pre-TCP-stack)
+    │  XDP_PASS or XDP_DROP
+    ▼
+L7Protection: SlowlorisGuard, TlsFloodGuard, H2StreamFloodGuard
+    │
+    ▼
+WorkerLimiter / GlobalRateLimiter (GCRA token bucket)
+    │
+    ▼
+Upstream proxy / application
+```
+
+<Card title="安全细节" icon="shield" href="/zh/security">
+  查看完整安全机制说明。
+</Card>
+
+## Crate 依赖图
+
+```
+arc-gateway (binary, state machine)
+    ├── arc-net (io_uring, sockets, buffers)
+    ├── arc-proto-http1 (HTTP/1.x parsing)
+    ├── arc-proto-h2 (HTTP/2 framing)
+    ├── arc-router (radix tree matching)
+    ├── arc-rate-limit (GCRA token bucket)
+    ├── arc-global-rate-limit (Redis two-tier limiter)
+    ├── arc-plugins (Wasmtime WASM runtime)
+    ├── arc-config (JSON/TOML/YAML, hot reload)
+    │       ├── arc-router
+    │       ├── arc-rate-limit
+    │       └── arc-plugins
+    ├── arc-observability (metrics, admin server)
+    ├── arc-acme (ACME certificate automation)
+    ├── arc-xdp-userspace (XDP/eBPF manager)
+    ├── arc-logging (NDJSON logs, ring buffers)
+    └── arc-common (error types)
+```
+
+## Crate 规模与职责
+
+| Crate | 代码行（约） | 角色 |
+|---|---|---|
+| `arc-gateway` | 13,638 | 主代理状态机、连接生命周期、worker 主循环 |
+| `arc-config` | 3,141 | 配置 schema、编译、ArcSwap 热更新 |
+| `arc-core` | 2,184 | 共享类型（`ArcConfig`、`NodeConfig`、`ListenerConfig` 等） |
+| `arc-net` | 1,642 | 原生 io_uring syscall 封装、缓冲池、socket 操作 |
+| `arc-router` | 1,089 | 压缩 radix 树、路由编译、O(log n) 匹配 |
+| `arc-acme` | 1,089 | ACME challenge 生命周期、TLS-ALPN-01、HTTP-01 |
+| `arc-global-rate-limit` | 904 | 两级限流、Redis Lua 后端、熔断器 |
+| `arc-proto-http1` | 591 | HTTP/1.x 请求/响应解析、chunked 解码 |
+| `arc-proto-h2` | 542 | HTTP/2 帧解析、SETTINGS、流控、流状态 |
+| `arc-logging` | 480 | NDJSON 编码、SPSC ring、io_uring 批量写、日志轮转 |
+| `arc-xdp-userspace` | 420 | XDP/eBPF 用户态管理、BPF map 写入、动态阈值计算 |
+| `arc-plugins` | 347 | Wasmtime 集成、实例池、`on_request` ABI |
+| `arc-observability` | 327 | `WorkerMetrics` 原子计数、管理服务、`/metrics` |
+| `arc-cli` | 126 | `arc logs tail/query` 命令 |
+| `arc-rate-limit` | 104 | 单层 GCRA 原子限流 |
+| `arc-common` | 100 | `ArcError`、`Result` |

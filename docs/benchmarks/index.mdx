@@ -1,0 +1,204 @@
+---
+title: "Benchmarks"
+description: "This page documents Arc's benchmark suite and explains how to run and interpret results."
+---
+
+## Requirements
+
+| Tool | Purpose |
+|---|---|
+| `wrk` | HTTP/1.1 load generator |
+| `h2load` | HTTP/2 load generator (part of nghttp2) |
+| `nginx` | Comparison proxy (must be in PATH) |
+| `python3` | Backend server and output parsing |
+| `curl` | Readiness checks |
+| `openssl` | Self-signed cert generation (H2 only) |
+
+Build Arc before running:
+
+```bash
+cargo build --release -p arc-gateway
+```
+
+---
+
+## HTTP/1.1 benchmark
+
+```bash
+cd benchmark
+bash scripts/run_h1_wrk_vs_nginx.sh
+```
+
+### What it does
+
+1. Starts `http_ok_backend.py` (a minimal Python HTTP server)
+2. Starts `arc-gateway` and `nginx` pointing to the backend
+3. Runs one warmup round, then `RUNS` measurement rounds of `wrk` against each
+4. Parses results and writes `summary.json` and `summary.md`
+
+### Default parameters
+
+| Variable | Default | Description |
+|---|---|---|
+| `RUNS` | `5` | Measurement iterations |
+| `THREADS` | `8` | wrk thread count |
+| `CONNECTIONS` | `256` | Concurrent connections |
+| `DURATION` | `30s` | Duration per measurement run |
+| `WARMUP` | `5s` | Warmup run duration (excluded from results) |
+| `ARC_WORKERS` | `1` | Arc worker thread count |
+| `REQUIRE_ZERO_NON2XX` | `1` | Fail if any non-2xx/3xx responses seen |
+
+Override any parameter via environment variable:
+
+```bash
+RUNS=10 CONNECTIONS=512 ARC_WORKERS=4 bash scripts/run_h1_wrk_vs_nginx.sh
+```
+
+---
+
+## HTTP/2 benchmark
+
+```bash
+cd benchmark
+bash scripts/run_h2_h2load_vs_nginx.sh
+```
+
+Uses `h2load` instead of `wrk`. A self-signed RSA-2048 certificate is generated automatically and shared between Arc and Nginx. Both terminate TLS; the backend is plain HTTP/1.1.
+
+### Default parameters
+
+| Variable | Default | Description |
+|---|---|---|
+| `RUNS` | `5` | Measurement iterations |
+| `REQUESTS` | `20000` | Total requests per run |
+| `CLIENTS` | `64` | Concurrent H2 clients |
+| `STREAMS` | `20` | Max concurrent streams per connection |
+| `THREADS` | `2` | h2load thread count |
+| `WARMUP_REQUESTS` | `1000` | Requests in the warmup run |
+
+---
+
+## Output artifacts
+
+Each run creates a timestamped directory under `benchmark/results/`:
+
+```
+benchmark/results/h1_wrk_20260302_121530/
+  arc.json              Arc config used
+  nginx.conf            Nginx config used
+  env.txt               Environment snapshot (see below)
+  arc_warmup.txt        Warmup output (excluded from results)
+  nginx_warmup.txt
+  arc_run1.txt          Raw wrk/h2load output, runs 1–N
+  ...
+  arc_runN.txt
+  nginx_runN.txt
+  summary.json          Machine-readable aggregated results
+  summary.md            Human-readable markdown table
+  summary.stdout.json   Copy of parse script stdout
+  arc.out.log           Arc stdout
+  arc.err.log           Arc stderr
+  backend.log           Backend server output
+  nginx.error.log       Nginx error log
+```
+
+**`env.txt` fields recorded before each run:**
+
+| Key | Content |
+|---|---|
+| `run_id` | Timestamp-based run identifier |
+| `git_commit` | `git rev-parse HEAD` |
+| `uname` | Full `uname -a` string |
+| `wrk_version` / `h2load_version` | Tool version string |
+| `nginx_version` | `nginx -v` output |
+| `arc_bin` | Resolved path to `arc-gateway` binary |
+| `params.*` | All tunable parameters at their resolved values |
+| `ports.*` | All port assignments used in this run |
+
+---
+
+## Reading results
+
+`summary.json` contains per-case aggregated statistics across all runs:
+
+```json
+{
+  "arc": {
+    "requests_per_sec": {
+      "mean": 95000.0,
+      "median": 95200.0,
+      "min": 94000.0,
+      "max": 96000.0
+    },
+    "latency_avg_ms": { "median": 2.7 }
+  },
+  "nginx": {
+    "requests_per_sec": { "median": 78000.0 }
+  },
+  "compare": {
+    "arc_vs_nginx_rps_ratio_median": 1.22,
+    "arc_vs_nginx_rps_gap_pct_median": 22.0
+  }
+}
+```
+
+`summary.md` contains the same data as a Markdown table for easy sharing.
+
+**Always use median values for published comparisons.** The `compare` block is included automatically when both `arc` and `nginx` cases are present.
+
+---
+
+## Reproducibility checklist
+
+- Use a fixed machine profile and kernel version (Linux ≥ 6.1 recommended for io_uring multishot)
+- Pin Arc and Nginx build versions; `env.txt` records the git commit
+- Run at least 5 rounds (`RUNS=5`) with identical settings
+- Use **median** values for published comparisons
+- Keep all raw `*_runN.txt` files alongside any published claim
+- Arc's data plane requires Linux io_uring; use WSL2 or a native Linux host (not macOS)
+- Disable CPU frequency scaling for consistent results: `cpupower frequency-set -g performance`
+
+---
+
+## Test backend
+
+`benchmark/backends/http_ok_backend.py` is a minimal `ThreadingHTTPServer` that serves a fixed-size response. Accepts any `GET`, `POST`, `PUT`, `DELETE`, or `HEAD`.
+
+| Argument | Default | Description |
+|---|---|---|
+| `--port` | required | Listen port |
+| `--payload-bytes` | `2` | Response body size (H1 test uses 2, H2 test uses 4096) |
+| `--delay-ms` | `0` | Per-request sleep (for slow-backend simulation) |
+| `--status` | `200` | Response status code |
+
+To test with a realistic backend response size:
+
+```bash
+PAYLOAD_BYTES=4096 bash scripts/run_h1_wrk_vs_nginx.sh
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Script fails with command not found: wrk or command not found: h2load">
+Install the missing tool. On Ubuntu/Debian: `apt install wrk` for wrk; `apt install nghttp2-client` for h2load. Verify versions with `wrk --version` and `h2load --version`.
+  </Accordion>
+  <Accordion title="REQUIRE_ZERO_NON2XX check failed">
+The benchmark found non-2xx/3xx responses. This usually means Arc or Nginx is rejecting requests (wrong config, rate limit, or backend not running). Check `backend.log` and `arc.err.log` in the output directory. Disable the check with `REQUIRE_ZERO_NON2XX=0` only when debugging.
+  </Accordion>
+  <Accordion title="Results vary too much between runs">
+High variance is common when CPU frequency scaling is enabled. Disable it with:
+```bash
+cpupower frequency-set -g performance
+```
+Also check for background processes consuming CPU. Use the median (not mean) from `summary.json` for published comparisons.
+  </Accordion>
+  <Accordion title="h2load certificate errors">
+The H2 benchmark generates a self-signed certificate. If h2load rejects it, check which TLS skip flag your h2load version uses. The script auto-detects `--insecure`, `--no-verify-peer`, or `-k`. If none match, update the script's TLS flag detection.
+  </Accordion>
+  <Accordion title="Arc or Nginx port is already in use">
+The script allocates ports at random from a safe range. If a collision occurs, kill the conflicting process or re-run — a new random port will be chosen.
+  </Accordion>
+</AccordionGroup>
+
+

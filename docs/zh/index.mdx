@@ -1,0 +1,171 @@
+---
+title: "简介"
+description: "Arc 是一个基于 io_uring 构建的 Rust 反向代理与 API 网关，专注于可预测、低延迟的流量处理。"
+---
+
+<Note>
+如果你想最快理解 Arc、在本地跑起来并跳到对应文档，这一页就是最佳入口。
+</Note>
+
+<Columns cols={2}>
+  <Card title="5 分钟快速上手" icon="rocket" href="/zh/getting-started">
+    用最小配置安装并运行 `arc-gateway`。
+  </Card>
+
+  <Card title="理解架构设计" icon="diagram-project" href="/zh/architecture">
+    了解按核线程模型、请求流转路径和 crate 边界。
+  </Card>
+
+  <Card title="配置生产行为" icon="sliders" href="/zh/configuration">
+    配置监听器、路由、上游、插件和运行时参数。
+  </Card>
+
+  <Card title="安全运行 Arc" icon="shield-halved" href="/zh/security">
+    查看限流、防护、TLS 姿态和加固建议。
+  </Card>
+</Columns>
+
+## 为什么选择 Arc
+
+很多反向代理在高负载下依赖事件循环协调，会带来额外系统调用和跨线程开销。Arc 使用每个 CPU 核心一个 worker，并为其分配专属资源，因此在高并发下延迟更可预测。
+
+## 快速开始
+
+<Steps>
+  <Step title="安装 Arc">
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/install.sh | sh
+arc-gateway --help
+```
+
+这个安装方式会把最新 GitHub Release 二进制安装到 `/usr/local/bin/arc-gateway`。
+
+  </Step>
+
+  <Step title="创建最小配置">
+
+```yaml
+node:
+  workers: 0
+
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:8080"
+
+upstreams:
+  - name: app
+    discovery:
+      type: static
+      endpoints:
+        - address: "127.0.0.1:3000"
+
+routes:
+  - name: root
+    match:
+      path: "/{*rest}"
+    action:
+      upstream: app
+```
+
+  </Step>
+
+  <Step title="运行 Arc">
+
+```bash
+arc-gateway --config arc.yaml
+```
+
+  </Step>
+
+  <Step title="验证运行结果">
+
+```bash
+curl http://localhost:8080/
+curl http://localhost:9090/healthz
+curl http://localhost:9090/metrics
+```
+
+如果 Arc 运行正常，`:8080` 会把流量代理到你的上游服务，`/healthz` 返回 `ok`，`/metrics` 返回 Prometheus 文本指标。
+
+  </Step>
+</Steps>
+
+## 核心能力
+
+| 能力 | 你能获得什么 |
+|---|---|
+| `io_uring` 数据平面 | 使用固定缓冲区和环形 I/O，构建低开销请求路径。 |
+| 按核线程 worker | 通过避免跨 worker 共享状态争用，获得更可预测的延迟。 |
+| HTTP/1.1 与 HTTP/2 | 覆盖常见南北向与内部服务流量协议。 |
+| TLS 与 ACME | Rustls 终止 TLS，并支持自动证书生命周期管理。 |
+| WASM 插件 | 不重编译核心代理逻辑，也能做请求过滤和扩展。 |
+| 速率限制 | 提供路由级与全局级的突发流量与滥用防护。 |
+| 可观测性 | 提供 Prometheus 指标、访问日志与追踪友好遥测。 |
+
+## 文档导航
+
+<Columns cols={2}>
+  <Card title="快速开始" icon="flag-checkered" href="/zh/getting-started">
+    快速完成 Arc 的安装、配置与运行。
+  </Card>
+
+  <Card title="部署" icon="server" href="/zh/deployment">
+    在 systemd、容器或 Kubernetes 中运行 Arc。
+  </Card>
+
+  <Card title="配置说明" icon="gear" href="/zh/configuration">
+    全量配置字段与行为参考。
+  </Card>
+
+  <Card title="流量管理" icon="route" href="/zh/traffic-management">
+    路由、匹配、插件和流量镜像。
+  </Card>
+
+  <Card title="TLS 与证书" icon="lock" href="/zh/tls-and-certificates">
+    TLS 配置、证书自动化和轮换建议。
+  </Card>
+
+  <Card title="安全" icon="shield" href="/zh/security">
+    安全加固、防护策略与风险控制。
+  </Card>
+
+  <Card title="可观测性" icon="chart-line" href="/zh/observability">
+    指标、日志与追踪集成方案。
+  </Card>
+
+  <Card title="控制面 API" icon="code" href="/zh/control-plane-api">
+    通过 HTTP 接口管理运行时行为。
+  </Card>
+
+  <Card title="CLI" icon="terminal" href="/zh/cli">
+    使用运维命令进行日志跟踪与查询。
+  </Card>
+
+  <Card title="基准测试" icon="gauge-high" href="/zh/benchmarks">
+    执行并解读性能基准测试结果。
+  </Card>
+</Columns>
+
+## 内部 crate 布局
+
+```text
+arc-gateway            主代理状态机与 worker 生命周期
+arc-config             配置 schema、编译与热重载装配
+arc-core               共享核心类型
+arc-net                io_uring 封装、缓冲池与 socket 操作
+arc-router             路由编译与匹配
+arc-acme               ACME challenge 与证书生命周期
+arc-global-rate-limit  基于 Redis 的集群级限流
+arc-proto-http1        HTTP/1.x 解析与响应处理
+arc-proto-h2           HTTP/2 帧、流与流控处理
+arc-plugins            Wasmtime 集成与请求钩子 ABI
+arc-observability      指标与管理端点
+arc-logging            NDJSON 日志管线与轮转
+arc-cli                运维 CLI 命令
+arc-rate-limit         本地 GCRA 限流器
+arc-common             共享错误与结果类型
+```
+
+下一步：阅读 [架构说明](/zh/architecture) 了解请求流转和依赖关系。

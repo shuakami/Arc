@@ -1,0 +1,185 @@
+---
+title: "CLI Reference"
+description: "The `arc` CLI reads NDJSON access logs produced by `arc-logging` on the local node. It has no network dependency and operates entirely by reading files on disk."
+---
+
+For multi-node log aggregation, use an external collector such as Vector, Fluent Bit, or similar, with a centralized backend like Loki or Elasticsearch.
+
+## Commands
+
+```
+arc logs tail [OPTIONS]
+arc logs query [OPTIONS]
+```
+
+### `arc logs tail`
+
+Follows a log file in real time, similar to `tail -F`. On startup it seeks to the last 4 MB of the file to avoid re-processing the entire history, then emits new lines as they arrive.
+
+On EOF it sleeps 200ms and reopens the file. This handles log rotation: Arc tracks the path, not the inode, so it automatically follows a new file created at the same path.
+
+```bash
+# Follow all logs
+arc logs tail
+
+# Follow only errors
+arc logs tail --level error
+
+# Follow a specific route
+arc logs tail --route api
+
+# Follow logs from the last 5 minutes
+arc logs tail --last 5m
+
+# Filter by status code
+arc logs tail --status 502
+arc logs tail --status 5xx
+
+# Trace a specific request
+arc logs tail --trace-id 4bf92f3577b34da6a3ce929d0e0e4736
+
+# Follow logs for a specific client IP
+arc logs tail --client-ip 203.0.113.5
+```
+
+### `arc logs query`
+
+Reads the log file from the beginning (or from a time cutoff if `--last` is specified) and prints matching lines, then exits.
+
+```bash
+# Query last hour of errors
+arc logs query --last 1h --level error
+
+# Find all 5xx responses in the last 30 minutes
+arc logs query --last 30m --status 5xx
+
+# Find all requests to a specific upstream
+arc logs query --upstream app-v2
+
+# Query with custom log file path
+arc logs query --file /var/log/arc/access.log --last 10m --status 502
+```
+
+---
+
+## Arguments
+
+### Common arguments (both `tail` and `query`)
+
+| Flag | Description |
+|---|---|
+| `--config <path>` | Path to Arc config file. Default: `/etc/arc/config.yaml`. Used to locate the log file path. |
+| `--file <path>` | Override log file path directly, bypassing config lookup. |
+| `--level <level>` | Exact match against the `level` field. Values: `info`, `warn`, `error`, `debug`. |
+| `--route <name>` | Exact match against the `route` field. |
+| `--status <code>` | Match HTTP status. Exact code (e.g. `502`) or wildcard (e.g. `5xx`, `4xx`). |
+| `--trace-id <id>` | Exact match against the `trace_id` field. |
+| `--client-ip <ip>` | Exact match against the `client_ip` field. |
+| `--upstream <name>` | Exact match against the `upstream` field. |
+
+### `tail`-only argument
+
+| Flag | Description |
+|---|---|
+| `--last <duration>` | Only show lines from within this window. Examples: `5m`, `1h`, `30s`, `200ms`. |
+
+### `query`-only argument
+
+| Flag | Description |
+|---|---|
+| `--last <duration>` | Only include lines newer than this duration relative to now. |
+
+---
+
+## Duration format
+
+| Suffix | Unit |
+|---|---|
+| `ms` | Milliseconds |
+| `s` | Seconds (also the default when no suffix is given) |
+| `m` | Minutes |
+| `h` | Hours |
+
+Examples: `5m`, `1h`, `30s`, `200ms`, `3600` (seconds).
+
+---
+
+## Log file resolution
+
+The CLI resolves the log file path in this order:
+
+1. If `--file` is provided, use it directly.
+2. Read the Arc config file (`--config`, default `/etc/arc/config.yaml`).
+3. Navigate to `logging.output.file` in the config.
+4. If not found, exit with a config error.
+
+---
+
+## Filter logic
+
+All filters are applied client-side. Each active filter must pass (logical AND). Lines that do not parse as valid JSON are silently skipped.
+
+**Status matching** handles two forms:
+
+- **Exact:** `502` — parsed as an integer and compared directly.
+- **Wildcard:** `5xx`, `4xx` — matches any status in the hundred-range (500–599, 400–499, etc.).
+
+**Time window:** Lines whose `ts` field is older than `now - duration` are skipped. Lines where the timestamp cannot be parsed are kept (fail-open).
+
+---
+
+## Operational notes
+
+**Local only.** The CLI reads files on the local node. It has no HTTP client and cannot query other nodes in a cluster.
+
+**High throughput.** Under high QPS, use `--last` to narrow the scan window. The `tail` command always starts from 4 MB before EOF regardless.
+
+**Log rotation.** The `tail` command reopens the file path on EOF, following rotations automatically.
+
+**Non-JSON lines.** Lines that do not parse as valid JSON (e.g. partial writes during rotation) are silently skipped.
+
+---
+
+## Examples
+
+```bash
+# Watch all 5xx errors as they happen
+arc logs tail --status 5xx
+
+# Find all requests slower than expected (logged via force_on_slow)
+arc logs query --last 1h --level warn
+
+# Debug a specific trace across a distributed system
+arc logs query --trace-id 4bf92f3577b34da6a3ce929d0e0e4736
+
+# Find all requests from a specific client in the last 15 minutes
+arc logs query --last 15m --client-ip 203.0.113.5
+
+# Monitor a canary upstream
+arc logs tail --upstream app-v2 --status 5xx
+
+# Use a custom config file location
+arc logs tail --config /opt/arc/config.yaml --level error
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="No log file found">
+Either `--file` is not specified and the config file does not contain a `logging.output.file` path, or the config file path (`--config`) is wrong. Verify the path with `--config /etc/arc/arc.json` and ensure `logging.output.file` is set.
+  </Accordion>
+  <Accordion title="arc logs tail shows no output">
+The log file exists but no new lines are being written. Confirm Arc is running and receiving traffic. Also check that `observability.access_log.enabled: true` and `sample` is not `0.0`.
+  </Accordion>
+  <Accordion title="Non-JSON lines are appearing">
+Arc emits NDJSON. Non-JSON lines (e.g., startup messages before logging is initialized) are silently skipped by `arc logs`. If you see them in the raw log file, they predate Arc's structured logging initialization and can be ignored.
+  </Accordion>
+  <Accordion title="--status 2xx filter returns no results">
+Wildcard status matching requires the `xx` suffix. Valid examples: `200`, `2xx`, `4xx`, `5xx`. Exact numeric codes and two-digit wildcards are both supported. Ensure there is traffic with matching status codes.
+  </Accordion>
+  <Accordion title="Log rotation causes tail to miss lines">
+`arc logs tail` handles rotation: when it reaches EOF, it sleeps 200ms and reopens the file. Lines written between the rename and reopen may be briefly missed. For high-throughput log analysis, use `arc logs query` with a time window instead.
+  </Accordion>
+</AccordionGroup>
+
+

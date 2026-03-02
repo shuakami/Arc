@@ -1,0 +1,133 @@
+openapi: 3.1.0
+info:
+  title: Arc Daemon Control Plane API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    OpenAPI for `arc-daemon` control-plane routes implemented in `crates/arc-daemon/src/main.rs`
+    and shared structs in `crates/arc-core/src/control.rs`.
+
+    This API is separate from the `arc-gateway` control-plane implementation.
+servers:
+  - url: http://127.0.0.1:22100
+security:
+  - {}
+paths:
+  /v1/status:
+    get:
+      operationId: getDaemonStatus
+      summary: Get daemon status
+      responses:
+        '200':
+          description: Current generation and node ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaemonStatusResponse'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/config:
+    get:
+      operationId: getDaemonConfig
+      summary: Get current raw config
+      responses:
+        '200':
+          description: Raw daemon config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArcConfigDocument'
+        '400':
+          description: Bad request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      operationId: pushDaemonConfig
+      summary: Compile and apply new config
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DaemonConfigPushRequest'
+      responses:
+        '200':
+          description: Applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaemonConfigPushResponse'
+        '400':
+          description: Invalid config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ArcConfigDocument:
+      type: object
+      additionalProperties: true
+      description: Raw Arc config JSON.
+
+    DaemonStatusResponse:
+      type: object
+      required: [generation, node_id]
+      properties:
+        generation:
+          type: string
+          format: uuid
+        node_id:
+          type: string
+
+    DaemonConfigPushRequest:
+      type: object
+      required: [config]
+      additionalProperties: false
+      properties:
+        config:
+          $ref: '#/components/schemas/ArcConfigDocument'
+
+    DaemonConfigPushResponse:
+      type: object
+      required: [generation]
+      properties:
+        generation:
+          type: string
+          format: uuid
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+

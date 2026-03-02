@@ -1,0 +1,172 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Arc",
+  "colors": {
+    "primary": "#0E7490",
+    "light": "#06B6D4",
+    "dark": "#155E75"
+  },
+  "favicon": "/favicon.png",
+  "logo": {
+    "light": "/logo/light.png",
+    "dark": "/logo/dark.png"
+  },
+  "navigation": {
+    "languages": [
+      {
+        "language": "en",
+        "tabs": [
+          {
+            "tab": "Guides",
+            "groups": [
+              {
+                "group": "Getting started",
+                "pages": [
+                  "index",
+                  "getting-started/index",
+                  "deployment/index"
+                ]
+              },
+              {
+                "group": "Operations",
+                "pages": [
+                  "configuration/index",
+                  "traffic-management/index",
+                  "tls-and-certificates/index",
+                  "security/index",
+                  "observability/index"
+                ]
+              },
+              {
+                "group": "Reference",
+                "pages": [
+                  "architecture/index",
+                  "control-plane-api/index",
+                  "cli/index",
+                  "benchmarks/index"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "API reference",
+            "groups": [
+              {
+                "group": "Gateway control plane",
+                "openapi": {
+                  "source": "openapi/arc-gateway-control-plane.openapi.yaml",
+                  "directory": "api-reference/gateway-control-plane"
+                }
+              },
+              {
+                "group": "Daemon control plane",
+                "openapi": {
+                  "source": "openapi/arc-daemon-control-plane.openapi.yaml",
+                  "directory": "api-reference/daemon-control-plane"
+                }
+              },
+              {
+                "group": "Observability",
+                "openapi": {
+                  "source": "openapi/arc-observability.openapi.yaml",
+                  "directory": "api-reference/observability"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "language": "zh",
+        "tabs": [
+          {
+            "tab": "指南",
+            "groups": [
+              {
+                "group": "快速上手",
+                "pages": [
+                  "zh/index",
+                  "zh/getting-started/index",
+                  "zh/deployment/index"
+                ]
+              },
+              {
+                "group": "运行与运维",
+                "pages": [
+                  "zh/configuration/index",
+                  "zh/traffic-management/index",
+                  "zh/tls-and-certificates/index",
+                  "zh/security/index",
+                  "zh/observability/index"
+                ]
+              },
+              {
+                "group": "参考资料",
+                "pages": [
+                  "zh/architecture/index",
+                  "zh/control-plane-api/index",
+                  "zh/cli/index",
+                  "zh/benchmarks/index"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "API 参考",
+            "groups": [
+              {
+                "group": "网关控制面",
+                "openapi": {
+                  "source": "openapi/arc-gateway-control-plane.zh.openapi.yaml",
+                  "directory": "zh/api-reference/gateway-control-plane"
+                }
+              },
+              {
+                "group": "守护进程控制面",
+                "openapi": {
+                  "source": "openapi/arc-daemon-control-plane.zh.openapi.yaml",
+                  "directory": "zh/api-reference/daemon-control-plane"
+                }
+              },
+              {
+                "group": "可观测性",
+                "openapi": {
+                  "source": "openapi/arc-observability.zh.openapi.yaml",
+                  "directory": "zh/api-reference/observability"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "GitHub",
+          "href": "https://github.com/shuakami/Arc",
+          "icon": "github"
+        },
+        {
+          "anchor": "Releases",
+          "href": "https://github.com/shuakami/Arc/releases",
+          "icon": "tag"
+        }
+      ]
+    }
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Issues",
+        "href": "https://github.com/shuakami/Arc/issues"
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/shuakami/Arc"
+    }
+  }
+}

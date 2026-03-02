@@ -1,0 +1,208 @@
+---
+title: "快速开始"
+description: "本指南会在大约五分钟内带你从零跑起 Arc。完成后，你会得到一个可代理 HTTP 流量的 Arc 实例，并完成限流配置，TLS 可按需开启。"
+---
+
+## 环境要求
+
+| 要求 | 最低版本 | 推荐版本 |
+|---|---|---|
+| Linux 内核 | 5.10 | 6.1+ |
+| `curl` 与 `sudo` | 最新版本 | 最新版本 |
+| `sha256sum` | 可用 | 建议使用 coreutils 版本 |
+| Redis（可选） | 6.0 | 7.x，仅在集群级限流时需要 |
+
+为了保证 multishot accept 和 SQPOLL 稳定性，建议使用 6.1+ 内核。先检查当前版本：
+
+```bash
+uname -r
+```
+
+## 第 1 步：安装 Arc（推荐）
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/install.sh | sh
+arc-gateway --help
+```
+
+安装脚本会下载最新 GitHub Release，完成 SHA256 校验，然后把 `arc-gateway` 安装到 `/usr/local/bin/arc-gateway`。当前只支持 Linux `x86_64` 与 Linux `arm64`。
+
+## 第 2 步：写最小配置
+
+Arc 支持 JSON、TOML、YAML 三种格式，会通过文件后缀自动识别。新建 `arc.yaml`：
+
+```yaml
+node:
+  workers: 0          # 0 = 从 available_parallelism() 自动识别 CPU 数
+  read_timeout: 30s
+  write_timeout: 30s
+  idle_timeout: 60s
+
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:8080"
+
+observability:
+  metrics_bind: "127.0.0.1:9090"
+
+upstreams:
+  - name: app
+    discovery:
+      type: static
+      endpoints:
+        - address: "127.0.0.1:3000"
+    pool:
+      max_idle: 128
+      idle_ttl: 30s
+
+routes:
+  - name: root
+    match:
+      path: "/{*rest}"
+    action:
+      upstream: app
+```
+
+## 第 3 步：启动测试后端
+
+任何监听在 3000 端口的 HTTP 服务都可以。用 Python 内置服务器即可：
+
+```bash
+python3 -m http.server 3000 &
+```
+
+## 第 4 步：运行 Arc
+
+```bash
+arc-gateway --config arc.yaml
+```
+
+## 第 5 步：验证
+
+```bash
+# 看代理响应
+curl -i http://localhost:8080/
+
+# 健康检查
+curl http://localhost:9090/healthz
+# 预期：ok
+
+# Prometheus 指标
+curl http://localhost:9090/metrics
+# 可关注：arc_requests_total, arc_active_current
+```
+
+## 添加速率限制
+
+Arc 使用 GCRA（Generic Cell Rate Algorithm）做限流。在任意路由上添加 `rate_limit`：
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: app
+    rate_limit:
+      qps: 100
+      burst: 200
+      key:
+        by: client_ip
+```
+
+保存后 Arc 会监听配置变化，并在约 500ms 内应用，不会中断现有连接。
+
+## 添加 TLS
+
+先准备证书，再增加一个 TLS 监听器：
+
+```yaml
+listeners:
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      certificates:
+        - sni: example.com
+          cert_pem: ./certs/example.com.crt
+          key_pem: ./certs/example.com.key
+```
+
+证书文件会在启动时读取，并在热更新时重新加载。自动签发证书请看 [TLS 与证书](/zh/tls-and-certificates)。
+
+## 添加 ACME（Let's Encrypt）
+
+```yaml
+listeners:
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      acme:
+        email: you@example.com
+        domains: [example.com]
+        account_key:
+          algorithm: ed25519
+          encrypted_key_path: ./acme-key.enc
+          passphrase:
+            type: env
+            name: ACME_KEY_PASSPHRASE
+        challenge:
+          type: tls_alpn_01
+          listener: https
+```
+
+## 热更新
+
+Arc 会监控配置文件修改时间。每次修改后可执行：
+
+```bash
+# 通过 systemd
+systemctl reload arc-gateway
+
+# 或直接发信号
+kill -HUP $(pidof arc-gateway)
+```
+
+监听地址、worker 数、io_uring ring 尺寸和 control plane 绑定地址变更都需要重启进程。其余变更（路由、上游、限流、TLS 证书、插件）可在线生效。
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="Arc 启动了，但 `curl http://localhost:8080/` 连接被拒绝">
+检查监听器 `bind` 地址和端口是否和你访问的一致。如果你绑定的是 `127.0.0.1:8080`，那从其他机器访问会被拒绝。
+  </Accordion>
+  <Accordion title="io_uring: Operation not permitted">
+io_uring 需要 Linux 5.10+。在 5.10 到 5.19 之间，部分 SQPOLL 操作可能需要更高权限。请设置 `RLIMIT_MEMLOCK` 或使用 `CAP_SYS_ADMIN`。在容器里还要确认 `seccomp` 没有拦截 io_uring 相关 syscall。
+  </Accordion>
+  <Accordion title="/healthz 返回 401 Unauthorized">
+说明配置了 control plane `auth_token`，但请求没有带认证头。请加上：`curl -H "Authorization: Bearer <token>" http://localhost:22100/healthz`。
+  </Accordion>
+  <Accordion title="改了配置但没生效">
+先确认文件的 mtime 是否真的变化（有些编辑器会先写临时文件再替换）。然后手动发送 `SIGHUP`：`kill -HUP $(pidof arc-gateway)`。同时检查 `/metrics` 里的 `arc_config_reload_total` 是否有增长。
+  </Accordion>
+  <Accordion title="TLS 场景下域名没有返回对应证书">
+确认 `certificates` 中的 `sni` 与访问主机名完全一致，或使用 `*.example.com` 这种通配符。数组中的第一张证书会作为兜底证书。
+  </Accordion>
+  <Accordion title="ACME challenge 校验失败">
+TLS-ALPN-01 需要 443 端口可达，HTTP-01 需要 80 端口可达。请检查防火墙和监听器 `bind` 是否对公网可达。ACME 报错会写入访问日志中的 `kind: "system"` 记录。
+  </Accordion>
+</AccordionGroup>
+
+## 下一步
+
+<CardGroup cols={2}>
+  <Card title="配置参考" icon="sliders" href="/zh/configuration">
+    全量配置字段说明。
+  </Card>
+  <Card title="安全防护" icon="shield" href="/zh/security">
+    XDP、限流和 L7 防护。
+  </Card>
+  <Card title="部署指南" icon="server" href="/zh/deployment">
+    systemd 与 Kubernetes 部署。
+  </Card>
+  <Card title="可观测性" icon="chart-line" href="/zh/observability">
+    指标、日志与追踪。
+  </Card>
+</CardGroup>

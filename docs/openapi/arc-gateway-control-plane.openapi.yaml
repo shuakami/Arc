@@ -1,0 +1,876 @@
+openapi: 3.1.0
+info:
+  title: Arc Gateway Control Plane API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    OpenAPI for Arc Gateway control-plane HTTP endpoints implemented in `crates/arc-gateway/src/control.rs`.
+
+    Authentication behavior:
+    - If `control_plane.auth_token` is set, send `Authorization: Bearer <token>`.
+    - If `control_plane.auth_token` is not set, only loopback clients are accepted.
+servers:
+  - url: http://127.0.0.1:22100
+tags:
+  - name: status
+    description: Node status and generation endpoints.
+  - name: config
+    description: Config fetch, long-poll, validation, and local apply endpoints.
+  - name: cluster
+    description: Cluster-level config push and circuit snapshot endpoints.
+  - name: gossip
+    description: Gossip membership, stats, and lifecycle endpoints.
+  - name: xdp
+    description: XDP status and map management endpoints.
+security:
+  - bearerAuth: []
+  - {}
+paths:
+  /v1/status:
+    get:
+      tags: [status]
+      operationId: getNodeStatus
+      summary: Get current node status
+      responses:
+        '200':
+          description: Current generation and node role
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/config:
+    get:
+      tags: [config]
+      operationId: getCurrentConfig
+      summary: Get active config JSON
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          description: Quoted generation ETag, for example `"123"`.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Raw canonical config JSON
+          headers:
+            ETag:
+              description: Quoted generation value.
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArcConfigDocument'
+        '304':
+          description: Config not modified
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [config]
+      operationId: applyLocalConfig
+      summary: Compile and apply config on this node
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArcConfigDocument'
+      responses:
+        '200':
+          description: Applied locally
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocalConfigApplyResponse'
+        '409':
+          description: Config is valid but requires restart for some fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestartRequiredResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/config/longpoll:
+    get:
+      tags: [config]
+      operationId: longPollConfig
+      summary: Wait for config generation change
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Last seen generation.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: timeout_ms
+          in: query
+          required: false
+          description: Wait timeout in milliseconds.
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+            maximum: 120000
+        - name: If-None-Match
+          in: header
+          required: false
+          description: Alternative way to pass `since`.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Config changed and new config returned
+          headers:
+            ETag:
+              description: Quoted generation value.
+              schema:
+                type: string
+            Cache-Control:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArcConfigDocument'
+        '304':
+          description: Timeout with no config change
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/config/validate:
+    post:
+      tags: [config]
+      operationId: validateConfig
+      summary: Compile config without applying it
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArcConfigDocument'
+      responses:
+        '200':
+          description: Config is valid
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigValidateResponse'
+        '409':
+          description: Config is valid but requires restart for some fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestartRequiredResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/config:
+    post:
+      tags: [cluster]
+      operationId: pushClusterConfig
+      summary: Leader pushes config to peers
+      description: |
+        Two-phase push with peer validate then commit. Only allowed when node role is `leader`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArcConfigDocument'
+      responses:
+        '200':
+          description: Push accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterConfigPushResponse'
+        '400':
+          description: Invalid config JSON for local compile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Called on non-leader node
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Restart-required config fields changed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestartRequiredResponse'
+        '503':
+          description: Quorum failure or partial commit failure
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterConfigPushResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/circuit/local:
+    get:
+      tags: [cluster]
+      operationId: getLocalCircuitSnapshot
+      summary: Get local circuit-breaker snapshot
+      responses:
+        '200':
+          description: Local circuit snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeCircuitSnapshot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/members:
+    get:
+      tags: [gossip]
+      operationId: getClusterMembers
+      summary: List gossip cluster members
+      responses:
+        '200':
+          description: Member list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/GossipMemberView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Gossip disabled or not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/gossip/stats:
+    get:
+      tags: [gossip]
+      operationId: getGossipStats
+      summary: Get gossip runtime stats
+      responses:
+        '200':
+          description: Gossip stats
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GossipStatsView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Gossip disabled or not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/gossip/join:
+    post:
+      tags: [gossip]
+      operationId: joinGossipPeer
+      summary: Join a peer into gossip cluster
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GossipJoinRequest'
+      responses:
+        '200':
+          description: Joined
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleOkResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Gossip disabled or not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/cluster/gossip/leave:
+    post:
+      tags: [gossip]
+      operationId: leaveGossipCluster
+      summary: Leave gossip cluster
+      responses:
+        '200':
+          description: Left cluster
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleOkResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Gossip disabled or not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/xdp/status:
+    get:
+      tags: [xdp]
+      operationId: getXdpStatus
+      summary: Get XDP runtime status
+      responses:
+        '200':
+          description: XDP status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpStatusResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP manager is not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/xdp/blacklist:
+    get:
+      tags: [xdp]
+      operationId: listXdpBlacklist
+      summary: List blacklisted IP/CIDR entries
+      parameters:
+        - name: max
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 65536
+            default: 1024
+      responses:
+        '200':
+          description: Blacklist entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpBlacklistListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP manager is not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [xdp]
+      operationId: addXdpBlacklistEntry
+      summary: Add blacklist entry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XdpBlacklistAddRequest'
+      responses:
+        '200':
+          description: Entry added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpBlacklistMutationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP manager is not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [xdp]
+      operationId: removeXdpBlacklistEntry
+      summary: Remove blacklist entry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XdpIpRequest'
+      responses:
+        '200':
+          description: Entry removed or not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpRemoveResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP manager is not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /v1/xdp/whitelist:
+    get:
+      tags: [xdp]
+      operationId: listXdpWhitelist
+      summary: List whitelisted IP/CIDR entries
+      parameters:
+        - name: max
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 65536
+            default: 1024
+      responses:
+        '200':
+          description: Whitelist entries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpWhitelistListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP manager is not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [xdp]
+      operationId: addXdpWhitelistEntry
+      summary: Add whitelist entry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XdpIpRequest'
+      responses:
+        '200':
+          description: Entry added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpSimpleIpResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP manager is not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [xdp]
+      operationId: removeXdpWhitelistEntry
+      summary: Remove whitelist entry
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/XdpIpRequest'
+      responses:
+        '200':
+          description: Entry removed or not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/XdpRemoveResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: XDP manager is not initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+
+  responses:
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: unauthorized
+    InternalError:
+      description: Internal error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ArcConfigDocument:
+      type: object
+      description: Raw Arc config JSON document.
+      additionalProperties: true
+
+    StatusResponse:
+      type: object
+      required: [generation, node_id, role]
+      properties:
+        generation:
+          type: integer
+          format: int64
+        node_id:
+          type: string
+        role:
+          type: string
+          enum: [standalone, leader, follower]
+
+    ConfigValidateResponse:
+      type: object
+      required: [ok, generation]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        generation:
+          type: integer
+          format: int64
+
+    LocalConfigApplyResponse:
+      type: object
+      required: [generation, scope]
+      properties:
+        generation:
+          type: integer
+          format: int64
+        scope:
+          type: string
+          enum: [local]
+
+    RestartRequiredResponse:
+      type: object
+      required: [ok, status, generation, changed_params, message]
+      properties:
+        ok:
+          type: boolean
+          const: false
+        status:
+          type: string
+          const: restart_required
+        generation:
+          type: integer
+          format: int64
+        changed_params:
+          type: array
+          items:
+            type: string
+        message:
+          type: string
+
+    ClusterConfigPushResponse:
+      type: object
+      required: [ok, generation]
+      properties:
+        ok:
+          type: boolean
+        generation:
+          type: integer
+          format: int64
+        validated:
+          type: integer
+          format: int32
+        committed:
+          type: integer
+          format: int32
+        quorum:
+          type: integer
+          format: int32
+        scope:
+          type: string
+          enum: [http_push, gossip]
+        reason:
+          type: string
+
+    NodeCircuitSnapshot:
+      type: object
+      required: [node_id, ts_ms, open_until_ms]
+      properties:
+        node_id:
+          type: string
+        ts_ms:
+          type: integer
+          format: int64
+        open_until_ms:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+
+    GossipMemberView:
+      type: object
+      required: [id, address, status, config_version, last_seen_ms]
+      properties:
+        id:
+          type: string
+        address:
+          type: string
+        status:
+          type: string
+        config_version:
+          type: integer
+          format: int64
+        last_seen_ms:
+          type: integer
+          format: int64
+
+    GossipStatsView:
+      type: object
+      required:
+        [messages_sent, messages_received, convergence_time_ms_p99, members_alive, members_suspect, members_dead]
+      properties:
+        messages_sent:
+          type: integer
+          format: int64
+        messages_received:
+          type: integer
+          format: int64
+        convergence_time_ms_p99:
+          type: integer
+          format: int64
+        members_alive:
+          type: integer
+          format: int32
+        members_suspect:
+          type: integer
+          format: int32
+        members_dead:
+          type: integer
+          format: int32
+
+    GossipJoinRequest:
+      type: object
+      required: [peer]
+      additionalProperties: false
+      properties:
+        peer:
+          type: string
+          description: Peer endpoint address for join.
+
+    SimpleOkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    XdpStatusResponse:
+      type: object
+      required:
+        [mode, interface, pin_base, kernel_release, program_version, blacklist_capacity, whitelist_capacity]
+      properties:
+        mode:
+          type: string
+        interface:
+          type: string
+        pin_base:
+          type: string
+        kernel_release:
+          type: string
+        program_version:
+          type: string
+        blacklist_capacity:
+          type: integer
+          format: int32
+        whitelist_capacity:
+          type: integer
+          format: int32
+
+    XdpBlacklistAddRequest:
+      type: object
+      required: [ip]
+      additionalProperties: false
+      properties:
+        ip:
+          type: string
+          description: IP or CIDR text (for example `203.0.113.7/32`).
+        ttl_ms:
+          type: integer
+          format: int64
+          minimum: 1
+        reason:
+          type: string
+
+    XdpIpRequest:
+      type: object
+      required: [ip]
+      additionalProperties: false
+      properties:
+        ip:
+          type: string
+          description: IP or CIDR text.
+
+    XdpBlacklistListResponse:
+      type: object
+      required: [count, items]
+      properties:
+        count:
+          type: integer
+          format: int32
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/XdpBlacklistItem'
+
+    XdpBlacklistItem:
+      type: object
+      required: [ip, prefix_len, reason, blocked_at_ns, ttl_ms, remaining_ms]
+      properties:
+        ip:
+          type: string
+        prefix_len:
+          type: integer
+          format: int32
+        reason:
+          type: string
+        blocked_at_ns:
+          type: integer
+          format: int64
+        ttl_ms:
+          type: integer
+          format: int64
+        remaining_ms:
+          type: [integer, 'null']
+          format: int64
+
+    XdpBlacklistMutationResponse:
+      type: object
+      required: [ok, ip, ttl_ms, reason]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        ip:
+          type: string
+        ttl_ms:
+          type: integer
+          format: int64
+        reason:
+          type: string
+
+    XdpWhitelistListResponse:
+      type: object
+      required: [count, items]
+      properties:
+        count:
+          type: integer
+          format: int32
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/XdpWhitelistItem'
+
+    XdpWhitelistItem:
+      type: object
+      required: [ip, prefix_len]
+      properties:
+        ip:
+          type: string
+        prefix_len:
+          type: integer
+          format: int32
+
+    XdpSimpleIpResponse:
+      type: object
+      required: [ok, ip]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        ip:
+          type: string
+
+    XdpRemoveResponse:
+      type: object
+      required: [ok, removed, ip]
+      properties:
+        ok:
+          type: boolean
+          const: true
+        removed:
+          type: boolean
+        ip:
+          type: string
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+

@@ -1,0 +1,246 @@
+---
+title: "安全"
+description: "生产环境的 HTTP 服务会在多个层面遭遇攻击：网络层的大流量洪泛、L4 连接耗尽、L7 的畸形与滥用请求。Arc 把三层防护解耦，保证某一层高压时不会让其他层完全失效。"
+---
+
+Arc 的安全能力分为三层独立体系，每层都在网络栈不同位置工作，可独立做丢弃或节流。
+
+```
+Internet traffic
+    │
+    ▼ L3/L4 — Kernel
+arc-xdp kernel program (XDP hook, pre-TCP-stack)
+  BPF maps: blacklist, whitelist
+  SYN-flood detection, RST validation, ACK flood detection
+    │ XDP_PASS
+    ▼ L4/L7 — Worker
+SlowlorisGuard — per-connection header-phase timeout/rate
+TlsFloodGuard — TLS handshake rate per IP
+H2StreamFloodGuard — concurrent streams and RST rate
+    │
+    ▼ L7 — Request
+WorkerLimiter / GlobalRateLimiter
+  GCRA token bucket, Redis backend, circuit breaker
+    │
+    ▼
+Upstream proxy / Application
+```
+
+---
+
+## XDP 与 eBPF 包过滤
+
+Arc 的内核程序（`arc-xdp`）挂载在网卡 XDP hook 点，在内核 TCP 栈处理之前就能拦截每个入站包。整个处理流程都在内核态完成，不需要每包切回用户态。
+
+### 检查流程
+
+每个包都会经过以下步骤：
+
+1. 解析以太网头和可选 VLAN 头
+2. 解析 IPv4/IPv6 并提取源 IP
+3. 查 **白名单**：命中即 `XDP_PASS`
+4. 查 **黑名单**：命中且未过期即 `XDP_DROP`
+5. TCP 包继续做：
+   - SYN flood 评分（按 IP 指数衰减）
+   - SYN proxy（返回 syncookie SYN-ACK，并校验 ACK）
+   - RST 校验（序列号窗口）
+   - ACK flood 评分
+6. UDP 包做按端口 PPS/BPS 限速
+
+### BPF Map
+
+| Map | 类型 | 容量 | 说明 |
+|---|---|---|---|
+| `arc_whitelist` | HASH | 65,536 | 永远放行的 IP |
+| `arc_blacklist` | LRU_HASH | 1,000,000 | 带 TTL 的封禁 IP |
+| `arc_syn_state` | PERCPU_HASH | 500,000 | 每 IP SYN 评分状态 |
+| `arc_global_stats` | PERCPU_ARRAY | 1（每 CPU） | 全局包统计 |
+| `arc_conntrack` | LRU_HASH | 2,000,000 | TCP 连接跟踪 |
+| `arc_config` | ARRAY | 1 | 运行时配置标志位（用户态写入） |
+| `arc_events` | RINGBUF | 4 MiB | 事件上报到用户态 |
+| `arc_port_stats` | PERCPU_ARRAY | 65,536 | UDP 分端口统计 |
+
+所有 map 默认 pin 到 `/sys/fs/bpf/arc/`。
+
+### 功能开关
+
+通过 control plane 的 `POST /v1/xdp/config` 在运行时开关 XDP 功能：
+
+```bash
+# 开启 SYN flood 检测 + SYN proxy（flags = 1 + 2 = 3）
+curl -X POST http://localhost:22100/v1/xdp/config \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"flags": 3}'
+```
+
+| 标志位 | 含义 |
+|---|---|
+| `CFG_F_ENABLE_SYN_FLOOD` | 按 IP 做 SYN 评分，超阈值丢弃 |
+| `CFG_F_ENABLE_SYN_PROXY` | 返回 syncookie SYN-ACK，并校验后续 ACK |
+| `CFG_F_ENABLE_RST_VALIDATE` | 丢弃不在序列号窗口内的 RST |
+| `CFG_F_ENABLE_ACK_FLOOD` | 按 IP 做 ACK flood 评分和丢弃 |
+| `CFG_F_GLOBAL_DEFENSE_MODE` | 全局防御模式，自动收紧阈值 |
+| `CFG_F_ENABLE_UDP_STATS` | 统计各目标端口 UDP 包 |
+| `CFG_F_ENABLE_UDP_RATE_LIMIT` | 按端口 PPS/BPS 超限丢弃 UDP |
+| `CFG_F_ENABLE_CIDR_LOOKUP` | 开启 CIDR 前缀匹配 |
+| `CFG_F_DROP_IPV4_FRAGS` | 丢弃 IPv4 分片，防止 L4 头绕过 |
+
+### 动态阈值计算
+
+用户态管理器每 100ms 运行一次后台任务，用 Welford 在线算法计算 SYN 速率的均值和标准差，动态阈值计算公式为：
+
+```
+threshold = mean + sigma_multiplier × sigma
+```
+
+当前 PPS 超过阈值时会自动进入 defense mode。
+
+### 黑白名单管理
+
+可通过 [网关控制面 API 参考](/zh/api-reference/gateway-control-plane) 在运行时管理 XDP 黑白名单：
+
+```bash
+# 封禁一个 IP 10 分钟
+curl -X POST http://localhost:22100/v1/xdp/blacklist \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"ip": "203.0.113.7/32", "ttl_ms": 600000, "reason": "manual"}'
+
+# 加入白名单
+curl -X POST http://localhost:22100/v1/xdp/whitelist \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"ip": "198.51.100.10/32"}'
+
+# 查看当前黑名单
+curl http://localhost:22100/v1/xdp/blacklist \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+### Kubernetes 说明
+
+XDP 需要 `NET_ADMIN`、`SYS_ADMIN` 和 `privileged: true`。多数托管 Kubernetes 平台不支持这组能力。部署清单中仅以注释形式保留示例。
+
+---
+
+## 速率限制
+
+Arc 内置两套独立限流机制。
+
+### 路由级限流（GCRA）
+
+最常用的是直接在路由上配置：
+
+```yaml
+routes:
+  - name: api
+    match:
+      path: /api/{*rest}
+    action:
+      upstream: app
+    rate_limit:
+      qps: 100
+      burst: 200
+      key:
+        by: client_ip   # 或 header（带 name）、route
+      status: 429
+```
+
+该模式使用单层 GCRA 令牌桶，状态存储在 worker 本地 `HashMap`，不会产生跨线程协调。
+
+### 两级全局限流
+
+跨节点统一限流由 `GlobalRateLimiter` 实现两级架构：
+
+**L1（worker 本地）：** 每个 worker 维护按 key 的令牌桶 `HashMap`，热路径无锁，`try_acquire` 每请求内联执行。  
+**L2（Redis 后端）：** 独立后端线程通过 Lua 脚本访问 Redis，做集群级令牌一致性。  
+**熔断器：** Redis 不可达时自动 open，worker 退化为 L1-only，默认 open 窗口 500ms。
+
+worker 热路径：
+
+1. 从后端最多拉取 8 条待处理补令牌结果
+2. 在本地 `l1` `HashMap` 查找或创建 key 对应 `Entry`
+3. 后端健康且全局令牌足够时消费 1 个全局令牌
+4. 后端健康但全局令牌耗尽时返回 429
+5. 后端故障时使用本地 L1 令牌桶
+6. 当令牌低于低水位时异步发起补充请求
+
+这样 worker 不会因为等 Redis 阻塞。
+
+---
+
+## L7 防护
+
+在正式进入限流前，Arc 会对每条连接执行三类 L7 防护。
+
+### SlowlorisGuard
+
+用于识别 Slowloris 攻击（极慢发送请求头，占满连接资源）。
+
+| 检查项 | 触发时机 | 动作 |
+|---|---|---|
+| 每 IP 未完成连接上限 | 新连接到达时 | 超限立即丢弃 |
+| 请求头超时 | 每次收字节时 | 超过 `headers_timeout_ns` 丢弃 |
+| 最低接收速率 | 每次收字节时 | 低于 `min_recv_rate_bps` 丢弃 |
+
+### TlsFloodGuard
+
+按 IP 限制每秒 TLS 握手速率。状态存储在固定大小 `AtomicU64` 数组中，每个槽编码 `(second << 32) | count`。当当前秒计数超过 `max_handshakes_per_ip_per_sec` 时拒绝连接。
+
+### H2StreamFloodGuard
+
+面向 HTTP/2 的 per-connection 防护，用于处理 stream flood 和 RST flood。
+
+| 事件 | 检查项 | 响应 |
+|---|---|---|
+| `HEADERS`（新流） | `open_streams > max_concurrent_streams` | 发送 `GOAWAY` |
+| `HEADERS`（新流） | `streams_created_in_window > max_streams_per_sec` | 发送 `GOAWAY` |
+| `RST_STREAM` | `rsts_in_window > max_rst_per_sec` | 发送 `GOAWAY` |
+
+计数窗口按秒重置，实际 `GOAWAY` 发送由 worker 负责。
+
+---
+
+## 请求超时
+
+Arc 以纳秒精度跟踪请求 deadline，不额外分配计时器对象。每个请求都会应用四类边界：
+
+| 超时项 | 生效阶段 |
+|---|---|
+| `connect` | 建立上游 TCP 连接 |
+| `response_header` | 请求发出后等待上游首字节 |
+| `per_try` | 单次重试的最大时长 |
+| `total` | 整个请求总时长上限 |
+
+每个阶段会同时受“阶段超时、单次尝试超时、总超时”三重约束，避免局部超时突破整体预算。
+
+示例：
+
+```yaml
+upstreams:
+  - name: api
+    timeouts:
+      connect: 2s
+      ttfb: 5s
+      write: 30s
+      read: 30s
+```
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="XDP 加载失败（XDP attach failed）">
+XDP 依赖网卡驱动支持。可先用 `ip link show <iface>` 检查。系统会按 `native → generic → skb` 兜底尝试；全部失败时网关会在无 XDP 模式继续启动并记录告警。可通过 `GET /v1/xdp/status` 确认状态。
+  </Accordion>
+  <Accordion title="误封 IP 变多">
+先查看黑名单：`curl http://localhost:22100/v1/xdp/blacklist`。流量突刺下动态阈值可能误判，可用 `DELETE /v1/xdp/blacklist` 解封，并通过 `POST /v1/xdp/config` 提高 `sigma_multiplier`（如 `{"sigma_multiplier": 5.0}`）来放宽阈值。配合 `/metrics` 中 `arc_xdp_blacklisted_total` 一起观察。
+  </Accordion>
+  <Accordion title="限流看起来没生效">
+先确认 `control_plane.enabled: true`，且 `observability.metrics_bind` 可访问。路由级限流只依赖本地 GCRA，不需要 Redis。集群级限流需要 Redis 可达且编译了 `redis` feature。可查看 `arc_ratelimit_rejected_total` 判断限流是否真的触发。
+  </Accordion>
+  <Accordion title="SlowlorisGuard 误伤慢客户端">
+该防护会对“请求头长期不完整”的连接触发。可以适当提高相关阈值，或在内网监听器不启用这类 L7 防护。
+  </Accordion>
+  <Accordion title="两级限流熔断器处于 open 状态">
+当 `/metrics` 中 `arc_ratelimit_circuit_open` 为 `1`，表示 Redis 后端不可达，Arc 已自动退化为 L1（每 worker）限流。请检查 Redis 连通性，并通过 control plane 查看熔断器的 `open_until_ns`。
+  </Accordion>
+</AccordionGroup>

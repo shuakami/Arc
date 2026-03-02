@@ -1,0 +1,212 @@
+---
+title: "TLS 与证书"
+description: "Arc 使用 Rustls 终止下游 TLS，支持静态证书、基于 SNI 的证书选择、到上游的 mTLS，以及通过 ACME 自动签发与续期证书。"
+---
+
+## 静态证书
+
+最直接方式是显式配置证书文件：
+
+```yaml
+listeners:
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      certificates:
+        - sni: "example.com"
+          cert_pem: /etc/arc/certs/example.com.crt
+          key_pem: /etc/arc/certs/example.com.key
+        - sni: "*.api.example.com"
+          cert_pem: /etc/arc/certs/api-wildcard.crt
+          key_pem: /etc/arc/certs/api-wildcard.key
+```
+
+Arc 会按顺序用客户端 SNI 匹配证书。支持通配符（`*.example.com`）。当没有命中任何 SNI 时，`certificates` 数组第一项会作为默认证书。
+
+证书文件在启动时读取，在热更新（SIGHUP 或文件变更）时会重新读取。
+
+## ACME：自动证书管理
+
+Arc 可以从 Let's Encrypt 或其他兼容 ACME 的 CA 自动签发并续期证书。
+
+### TLS-ALPN-01（推荐）
+
+挑战和签发都走 HTTPS 监听器本身，不依赖 HTTP 端口或 DNS 写入：
+
+```yaml
+listeners:
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      acme:
+        email: ops@example.com
+        domains: [example.com, www.example.com]
+        account_key:
+          algorithm: ed25519
+          encrypted_key_path: /etc/arc/acme-key.enc
+          passphrase:
+            type: env
+            name: ACME_KEY_PASSPHRASE
+        challenge:
+          type: tls_alpn_01
+          listener: https
+        renew_before: 720h
+```
+
+### HTTP-01
+
+需要一个 80 端口的 HTTP 监听器：
+
+```yaml
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:80"
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      acme:
+        email: ops@example.com
+        domains: [example.com]
+        account_key:
+          algorithm: ed25519
+          encrypted_key_path: /etc/arc/acme-key.enc
+          passphrase:
+            type: env
+            name: ACME_KEY_PASSPHRASE
+        challenge:
+          type: http_01
+          listener: http
+```
+
+### DNS-01
+
+支持 Cloudflare、Route53、RFC2136、webhook 和外部命令：
+
+**Cloudflare：**
+
+```yaml
+challenge:
+  type: dns_01
+  provider:
+    name: cloudflare
+    api_token: "your-cloudflare-token"
+```
+
+**Route53：**
+
+```yaml
+challenge:
+  type: dns_01
+  provider:
+    name: route53
+    access_key_id: "AKIAIOSFODNN7EXAMPLE"
+    secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    region: us-east-1
+```
+
+**外部命令（hook）：**
+
+```yaml
+challenge:
+  type: dns_01
+  provider:
+    name: hook
+    command: /usr/local/bin/dns-challenge-hook
+    args: [--domain, "{domain}", --record, "{record}"]
+```
+
+## 账号密钥配置
+
+ACME 账号密钥会加密存储在磁盘，Arc 可从环境变量或文件读取解密口令：
+
+```yaml
+account_key:
+  algorithm: ed25519
+  encrypted_key_path: /etc/arc/acme-key.enc
+  passphrase:
+    type: env
+    name: ACME_KEY_PASSPHRASE
+```
+
+或：
+
+```yaml
+  passphrase:
+    type: file
+    path: /etc/arc/acme-passphrase
+```
+
+## TLS 版本与密码套件控制
+
+```yaml
+tls:
+  min_version: tls12
+  max_version: tls13
+  cipher_suites: []
+  session_resumption: true
+```
+
+## 上游 mTLS
+
+在上游定义中增加 `tls` 块即可启用双向 TLS：
+
+```yaml
+upstreams:
+  - name: secure-api
+    discovery:
+      type: static
+      endpoints:
+        - address: "10.0.1.1:8443"
+    tls:
+      ca_pem: /etc/arc/certs/internal-ca.crt
+      client_cert_pem: /etc/arc/certs/client.crt
+      client_key_pem: /etc/arc/certs/client.key
+      insecure: false
+```
+
+配置了 `tls` 后，Arc 在每次创建新上游连接时都会执行 TLS 握手；若同时配置 `client_cert_pem` 与 `client_key_pem`，会携带客户端证书完成 mTLS。
+
+## 基于 SNI 的证书选择
+
+Arc 根据 ClientHello 里的 SNI 扩展选择证书，顺序为：
+
+1. 精确匹配（`example.com`）
+2. 通配匹配（`*.example.com`）
+3. 默认证书（数组第一项）
+
+在 ACME 场景下，集群通过 Rendezvous hashing 保证同一域名稳定命中同一节点，避免多节点并发挑战导致竞态。
+
+## 证书续期
+
+Arc 会跟踪证书过期时间，在 `renew_before`（默认 30 天）窗口前自动续期。续期流程：
+
+1. 向 ACME CA 发起流程并完成挑战
+2. 新证书通过 `ArcSwap` 原子激活
+3. 已建立 TLS 连接继续使用旧证书直到断开
+4. 新建连接立即使用新证书
+
+证书续期不需要进程重启，也不依赖手动热更新。
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="域名没有返回正确证书">
+请确认 `certificates` 中的 `sni` 与目标主机名精确匹配，或使用正确的通配符格式（`*.example.com`）。若无匹配，数组第一张证书会兜底。可用 `openssl s_client -connect localhost:8443 -servername example.com` 检查实际返回证书。
+  </Accordion>
+  <Accordion title="ACME challenge 校验失败">
+TLS-ALPN-01 需要 443 对公网可达，且 `acme.challenge.listener` 要与实际 TLS 监听器 `name` 一致。HTTP-01 需要 80 端口 HTTP 监听。DNS-01 需要正确的 DNS 提供商凭据和可达权威 DNS。ACME 错误会写入 `kind: "system"` 日志。
+  </Accordion>
+  <Accordion title="证书没有自动续期">
+只有在接近 `renew_before`（默认 `720h`）窗口时才会触发续期。如果证书还“足够新”，不会执行续期。可查看 `/metrics` 中 `arc_tls_cert_expiry_seconds`。若确实超期未续，重点排查 challenge 可达性。
+  </Accordion>
+  <Accordion title="TLS handshake error: no certificates configured">
+说明监听器 `kind` 是 `https`/`h3`，但既没配置 `tls.certificates` 也没配置 `tls.acme`。请至少配置其一。
+  </Accordion>
+  <Accordion title="上游 mTLS 报 certificate verify failed">
+确认 `tls.ca_pem` 指向正确 CA 证书链。如果上游是自签证书，开发环境可临时使用 `tls.insecure: true`，生产环境不建议这么做。
+  </Accordion>
+</AccordionGroup>

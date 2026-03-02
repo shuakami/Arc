@@ -1,0 +1,134 @@
+openapi: 3.1.0
+info:
+  title: Arc 守护进程控制面 API
+  version: 1.0.0
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    `arc-daemon` 控制面路由的 OpenAPI 定义，接口实现位于 `crates/arc-daemon/src/main.rs`，
+    共享结构定义位于 `crates/arc-core/src/control.rs`。
+
+    这个 API 与 `arc-gateway` 的控制面实现相互独立。
+servers:
+  - url: http://127.0.0.1:22100
+security:
+  - {}
+paths:
+  /v1/status:
+    get:
+      operationId: getDaemonStatus
+      summary: 获取守护进程状态
+      responses:
+        '200':
+          description: 当前代际与节点 ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaemonStatusResponse'
+        '400':
+          description: 请求错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 内部错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/config:
+    get:
+      operationId: getDaemonConfig
+      summary: 获取当前原始配置
+      responses:
+        '200':
+          description: 守护进程原始配置
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArcConfigDocument'
+        '400':
+          description: 请求错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 内部错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    post:
+      operationId: pushDaemonConfig
+      summary: 编译并应用新配置
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DaemonConfigPushRequest'
+      responses:
+        '200':
+          description: 已应用
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DaemonConfigPushResponse'
+        '400':
+          description: 配置无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: 内部错误
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    ArcConfigDocument:
+      type: object
+      additionalProperties: true
+      description: 原始 Arc 配置 JSON。
+
+    DaemonStatusResponse:
+      type: object
+      required: [generation, node_id]
+      properties:
+        generation:
+          type: string
+          format: uuid
+        node_id:
+          type: string
+
+    DaemonConfigPushRequest:
+      type: object
+      required: [config]
+      additionalProperties: false
+      properties:
+        config:
+          $ref: '#/components/schemas/ArcConfigDocument'
+
+    DaemonConfigPushResponse:
+      type: object
+      required: [generation]
+      properties:
+        generation:
+          type: string
+          format: uuid
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+

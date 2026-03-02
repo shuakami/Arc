@@ -1,0 +1,325 @@
+---
+title: "可观测性"
+description: "要理解 Arc 在做什么、以及某个请求为什么会那样处理，需要趋势级指标、请求级结构化日志和跨服务 Trace 上下文三类数据。Arc 原生提供这三类能力，不依赖额外 agent。"
+---
+
+Arc 提供三套可观测性子系统：Prometheus 指标、NDJSON 结构化访问日志、W3C 分布式追踪。
+
+---
+
+## 指标（Metrics）
+
+### 配置
+
+```yaml
+observability:
+  metrics_bind: "127.0.0.1:9090"
+  metrics_enabled: true
+```
+
+### 端点
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/metrics` | `GET` | Prometheus 文本格式 |
+| `/healthz` | `GET` | 返回 `ok` |
+
+访问控制规则：如果未配置 `auth_token`，只允许回环地址（`127.x`、`::1`）访问；如果配置了 `auth_token`，任意来源 IP 都必须带 `Authorization: Bearer <token>`。
+
+### Prometheus 指标参考
+
+**连接类指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_accepted_total` | counter | 已接受 TCP 连接总数 |
+| `arc_accept_rejected_total` | counter | accept 阶段拒绝连接总数 |
+| `arc_active_current` | gauge | 当前活跃连接数 |
+| `arc_closed_total` | counter | 已关闭连接总数 |
+
+**请求/响应指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_requests_total` | counter | 收到的 HTTP 请求总数 |
+| `arc_responses_total` | counter | 发送的 HTTP 响应总数 |
+
+**流量字节指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_bytes_client_in_total` | counter | 从客户端接收字节数 |
+| `arc_bytes_client_out_total` | counter | 发送给客户端字节数 |
+| `arc_bytes_upstream_in_total` | counter | 从上游接收字节数 |
+| `arc_bytes_upstream_out_total` | counter | 发送给上游字节数 |
+
+**阶段耗时指标**（`cli_read`、`up_conn`、`up_write`、`up_read`、`cli_write`）：
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_phase_time_sum_ns_<phase>` | counter | 阶段累计耗时（纳秒） |
+| `arc_phase_count_<phase>` | counter | 阶段观测次数 |
+| `arc_phase_timeouts_<phase>` | counter | 阶段超时次数 |
+
+**io_uring 健康指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_ring_sq_dropped_total` | counter | 提交队列丢弃次数 |
+| `arc_ring_cq_overflow_total` | counter | 完成队列溢出次数 |
+
+> `arc_ring_sq_dropped_total` 或 `arc_ring_cq_overflow_total` 非 0，通常表示 ring 过小。请提高 `io_uring.uring_entries`。
+
+**上游连接池指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_upstream_pool_open_current` | gauge | 当前上游总连接数 |
+| `arc_upstream_pool_idle_current` | gauge | 当前上游空闲连接数 |
+| `arc_upstream_pool_busy_current` | gauge | 当前上游忙连接数 |
+
+**镜像流量指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_mirror_submitted_total` | counter | 已入队镜像任务 |
+| `arc_mirror_sent_total` | counter | 已发送镜像请求 |
+| `arc_mirror_queue_full_total` | counter | 队列满导致的丢弃次数 |
+| `arc_mirror_timeout_total` | counter | 超时导致的丢弃次数 |
+| `arc_mirror_status_2xx_total` | counter | 影子流量 2xx 响应数 |
+| `arc_mirror_latency_sum_ns` | counter | 影子流量总延迟 |
+
+**日志子系统指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_log_written_total{kind=...}` | counter | 各类日志写入数 |
+| `arc_log_dropped_total{reason=...}` | counter | 各原因日志丢弃数 |
+| `arc_log_write_errors_total` | counter | 日志写入错误总数 |
+| `arc_log_buffer_depth` | gauge | ring buffer 深度 |
+| `arc_log_write_duration_seconds` | histogram | io_uring 批写延迟 |
+
+**限流指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_ratelimit_rejected_total` | counter | 限流拒绝请求总数 |
+| `arc_ratelimit_circuit_open` | gauge | Redis 熔断器打开时为 `1` |
+
+**配置与路由指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_config_reload_total` | counter | 成功热更新次数 |
+| `arc_config_reload_error_total` | counter | 热更新拒绝次数 |
+| `arc_route_requests_total{route="..."}` | counter | 各命名路由匹配请求数 |
+
+**TLS 与插件指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_tls_cert_expiry_seconds` | gauge | 最近过期证书剩余秒数 |
+| `arc_plugin_timeout_total` | counter | 插件预算超时中断次数 |
+
+**XDP 指标：**
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `arc_xdp_blacklisted_total` | counter | 加入 XDP 黑名单的 IP 总数（自动 + 手工） |
+
+### 设计说明
+
+worker 线程通过 `AtomicU64::fetch_add`（`Ordering::Relaxed`）写指标，单指令、无锁。`WorkerMetrics` 使用 `#[repr(C, align(64))]`，保证每个 worker 指标结构体占独立缓存行。管理端线程每 250ms 刷新一次指标快照。
+
+---
+
+## 访问日志（Access Logs）
+
+Arc 输出结构化 NDJSON 访问日志，不提供纯文本格式。
+
+### 配置
+
+```yaml
+logging:
+  output:
+    file: /var/log/arc/access.log
+    stdout: false
+    rotation:
+      max_size: 500mb
+      max_files: 30
+      compress: true
+
+  access:
+    sample: 0.01
+    force_on_status: [401, 403, 429, 500, 502, 503, 504]
+    force_on_slow: 500
+
+  redact:
+    headers: [Authorization, Cookie, X-Api-Key]
+    query_params: [token, secret, password]
+
+  writer:
+    ring_capacity: 8192
+    batch_bytes: 262144
+    flush_interval: 50
+```
+
+### 日志字段
+
+每条访问日志是一行 JSON 对象：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `ts` | string（RFC 3339，纳秒） | 请求时间戳 |
+| `level` | string | `info`、`warn`、`error` |
+| `kind` | string | `"access"` |
+| `trace_id` | string | W3C trace ID（32 位 hex） |
+| `span_id` | string | W3C span ID（16 位 hex） |
+| `request_id` | string | 请求唯一 ID |
+| `method` | string | HTTP 方法 |
+| `path` | string | 请求路径 |
+| `query` | string | 查询串（已脱敏） |
+| `host` | string | Host 头 |
+| `status` | number | HTTP 状态码 |
+| `route` | string | 命中路由名 |
+| `upstream` | string | 上游组名 |
+| `upstream_addr` | string | 实际上游地址 |
+| `client_ip` | string | 客户端 IP |
+| `client_port` | number | 客户端端口 |
+| `bytes_sent` | number | 返回字节数 |
+| `bytes_received` | number | 接收字节数 |
+| `duration_ms` | number | 总耗时（毫秒） |
+| `upstream_connect_ms` | number? | 上游建连耗时 |
+| `upstream_response_ms` | number? | 上游首字节耗时 |
+| `attempt` | number | 重试次数 |
+| `tls` | boolean | 是否 TLS 连接 |
+| `http_version` | string | `HTTP/1.1` 或 `HTTP/2.0` |
+
+示例：
+
+```json
+{
+  "ts": "2026-03-02T10:45:23.123456789Z",
+  "level": "info",
+  "kind": "access",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "request_id": "01HRXYZ...",
+  "method": "GET",
+  "path": "/api/users/42",
+  "query": "",
+  "host": "api.example.com",
+  "status": 200,
+  "route": "api",
+  "upstream": "app",
+  "upstream_addr": "10.0.1.1:3000",
+  "client_ip": "203.0.113.5",
+  "client_port": 54321,
+  "bytes_sent": 1024,
+  "bytes_received": 256,
+  "duration_ms": 12,
+  "upstream_connect_ms": 1,
+  "upstream_response_ms": 8,
+  "attempt": 1,
+  "tls": true,
+  "http_version": "HTTP/2.0"
+}
+```
+
+### 脱敏
+
+Arc 在写日志前会做敏感信息脱敏：
+
+- **Header**：大小写不敏感匹配，值替换为 `[REDACTED]`
+- **Query 参数**：大小写不敏感匹配，值替换为 `[REDACTED]`
+- **Body 字段**：JSONPath 风格（`$.field.subfield`），值替换为 `"[REDACTED]"`
+
+脱敏规则支持热更新自动重建。
+
+### 文件轮转
+
+当当前日志文件超过 `max_size` 时触发轮转，流程如下：
+
+1. 当前文件重命名为带时间戳的归档文件（元数据操作，几乎瞬时）
+2. 立即重开原路径继续写入，避免中断
+3. 如 `compress: true`，后台线程异步 gzip 压缩归档
+4. 仅保留 `max_files` 数量的归档，其余删除
+
+### 设计说明：不反压 worker
+
+worker 把日志事件写入有界 SPSC ring。队列满时直接丢弃并增计数，不会阻塞业务线程。writer 线程负责汇聚 ring、手工编码 NDJSON（写时不走 serde），再通过 io_uring `Write` 批量刷盘。
+
+---
+
+## 分布式追踪（Tracing）
+
+Arc 实现了 [W3C Trace Context](https://www.w3.org/TR/trace-context/)。每个请求都会拥有 `trace_id` 和 `span_id`，并写入访问日志，同时向上游透传。
+
+### Trace 上下文解析规则
+
+| 场景 | 行为 |
+|---|---|
+| 请求带合法 `traceparent` | 复用来路 `trace_id`，来路 `span_id` 作为父 span |
+| `traceparent` 缺失或非法 | 新生成 128-bit `trace_id` + 64-bit `span_id` |
+| 转发到上游 | 保持相同 `trace_id`，为子 span 生成新 `span_id` |
+| 写日志 | 以小写 hex 形式写出 `trace_id`、`span_id` |
+
+### `traceparent` 格式
+
+```
+00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+- 2 位版本号（`00`）
+- 32 位 trace ID（不能全 0）
+- 16 位 span ID（不能全 0）
+- 2 位 flags（`01` 表示 sampled）
+
+### 上游透传
+
+Arc 转发到上游时，会携带同一个 `trace_id`，但生成新的 `span_id`，形成父子关系：
+
+```
+Client → Arc:     traceparent: 00-TTTT-SSSS-01
+Arc → Upstream:   traceparent: 00-TTTT-SNEW-01
+Access log:       trace_id=TTTT, span_id=SSSS
+```
+
+### 按 trace ID 查日志
+
+```bash
+# 用 arc CLI
+arc logs query --trace-id 4bf92f3577b34da6a3ce929d0e0e4736
+
+# 用 jq 分析日志文件
+grep "4bf92f3577b34da6a3ce929d0e0e4736" /var/log/arc/access.log | jq .
+```
+
+### OTLP 导出
+
+```yaml
+observability:
+  tracing:
+    endpoint: "http://otel-collector:4317"
+    insecure: true
+```
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="/metrics 返回 404 或连接被拒绝">
+确认 `observability.metrics_bind` 已配置且 Arc 正在运行。默认是 `127.0.0.1:9090`，从其他主机访问会被拒绝。可先本机验证：`curl http://127.0.0.1:9090/metrics`。
+  </Accordion>
+  <Accordion title="访问日志没有输出">
+确认 `observability.access_log.enabled: true`，并且 `logging.output.file` 指向可写路径，同时 `sample` 不为 `0.0`。日志是异步写入，writer 忙时会出现短暂延迟。
+  </Accordion>
+  <Accordion title="日志文件没有轮转">
+轮转条件是 `FileState.offset >= RotationConfig.max_size_bytes`。文件未达到阈值时不会轮转。可查看 `/metrics` 中 `arc_log_written_total`。如果开启压缩且 `arc_log_compress_dropped_total` 增长，说明压缩队列已满，需要降写入速率或提高 `ARC_LOG_COMPRESS_QUEUE_CAPACITY`。
+  </Accordion>
+  <Accordion title="OTLP 后端看不到 Trace">
+确认 `observability.tracing.endpoint` 从 Arc 到 collector 可达。如果 collector 没有 TLS，请设置 `insecure: true`。即便 OTLP 出口异常，也可以先看访问日志里的 `trace_id` 判断 Arc 本地 trace 是否正常生成。
+  </Accordion>
+  <Accordion title="arc_worker_phase_*_seconds 相关直方图没数据">
+阶段耗时指标只有在请求完整经过对应处理阶段后才会出现。先确认 Arc 确实在处理代理流量。若在首批请求后才出现，通常属于预期行为。
+  </Accordion>
+</AccordionGroup>

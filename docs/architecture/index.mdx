@@ -1,0 +1,160 @@
+---
+title: "Architecture"
+description: "Arc's architecture is built on two principles: thread-per-core and io_uring. Every design decision flows from these two choices."
+---
+
+## Thread-per-core
+
+Each worker thread binds to one CPU core and opens its own `SO_REUSEPORT` listener socket. The kernel distributes incoming connections across workers automatically. Workers never share mutable state during request processing.
+
+**What each worker owns exclusively:**
+
+| Resource | Type |
+|---|---|
+| io_uring ring | `Uring` struct (arc-net) |
+| Fixed buffer pool | `FixedBuffers` (arc-net) |
+| Connection slab | indexed by `ConnId` (arc-gateway) |
+| Upstream connection pool | `UpstreamPool` (arc-gateway) |
+| Plugin instance pools | `PluginCatalog` per-pool (arc-plugins) |
+| Rate limit L1 cache | `WorkerLimiter` (arc-global-rate-limit) |
+| Metrics counters | `WorkerMetrics` (arc-observability) |
+| Log ring buffer | SPSC ring (arc-logging) |
+
+**What workers share (read-only or atomic):**
+
+| Resource | Mechanism |
+|---|---|
+| Routes, upstreams, plugins, limiters | `ArcSwap<Arc<SharedConfig>>` — acquire load per request tick |
+| Metrics arrays | `AtomicU64` counters; admin thread reads with relaxed ordering |
+| Global rate limit backend | `GlobalRateLimiter` with L2 Redis; workers contact it asynchronously for refills |
+| XDP BPF maps | Kernel-managed; userspace `XdpManager` writes via libbpf |
+
+## io_uring data plane
+
+Arc uses Linux's io_uring interface rather than epoll or an async runtime like Tokio. This eliminates per-operation syscall overhead. The key io_uring features Arc uses:
+
+- **SQPOLL** — kernel polling thread that drains the submission queue without syscalls from userspace
+- **Fixed buffers** — pre-registered buffer pool; read/write use buffer indices rather than pointers
+- **Fixed files** — pre-registered file descriptor set; eliminates fd table lookup overhead
+- **Multishot accept** — single `accept` SQE that re-arms itself after each connection; no re-submission per accept
+- **Multishot timeout** — single timeout SQE for the connection slab timer wheel
+
+## Shared configuration and hot reload
+
+All workers share a single `ArcSwap<Arc<SharedConfig>>`. `SharedConfig` contains the compiled router, compiled upstreams, plugin catalog, per-route rate limiters, and TLS state. It is immutable after construction.
+
+The hot reload flow:
+
+```
+Config file
+    │ mtime change
+    ▼
+Background watcher thread
+    │ compile_config() → SharedConfig
+    ▼
+ArcSwap::store() (release-store)
+    │
+    ├── Worker 0: ArcSwap::load() (acquire)
+    ├── Worker 1: ArcSwap::load() (acquire)
+    └── Worker N: ArcSwap::load() (acquire)
+```
+
+Fields that require a process restart (listener addresses, worker count, io_uring ring sizing, control plane binding) are gated by `restart_required_changes()`. If any of those fields change, hot reload is rejected.
+
+All config formats are normalized to canonical JSON internally. TOML and YAML files are parsed, converted to a `serde_json::Value`, keys are sorted, and the result is stored as `raw_json: Arc<str>` in `SharedConfig`. This ensures deterministic fingerprinting across cluster nodes.
+
+## Request flow
+
+```
+Kernel (io_uring CQE: accept or read)
+    │
+Worker::run()
+    │
+    ├── Router::match() — host, method, path, headers
+    │       └── MatchResult or 404
+    │
+    ├── Limiter::try_acquire() — per-route token check
+    │
+    ├── PluginCatalog::invoke() — on_request() → 0=allow / status=deny
+    │
+    ├── UpstreamPool — checkout or connect
+    │
+    ├── io_uring write SQE (fixed buffer → upstream fd)
+    │
+    ├── io_uring read CQE (upstream response)
+    │
+    ├── io_uring write SQE (fixed buffer → client fd)
+    │
+    ├── WorkerMetrics — phase_count.fetch_add
+    │
+    └── AccessLogContext — emit AccessLogRecord
+```
+
+## Security layers
+
+Arc applies three independent security layers:
+
+```
+Internet traffic
+    │
+    ▼
+arc-xdp kernel program (XDP hook, pre-TCP-stack)
+    │  XDP_PASS or XDP_DROP
+    ▼
+L7Protection: SlowlorisGuard, TlsFloodGuard, H2StreamFloodGuard
+    │
+    ▼
+WorkerLimiter / GlobalRateLimiter (GCRA token bucket)
+    │
+    ▼
+Upstream proxy / application
+```
+
+<Card title="Security details" icon="shield" href="/security">
+  See full detail.
+</Card>
+
+## Crate dependency graph
+
+```
+arc-gateway (binary, state machine)
+    ├── arc-net (io_uring, sockets, buffers)
+    ├── arc-proto-http1 (HTTP/1.x parsing)
+    ├── arc-proto-h2 (HTTP/2 framing)
+    ├── arc-router (radix tree matching)
+    ├── arc-rate-limit (GCRA token bucket)
+    ├── arc-global-rate-limit (Redis two-tier limiter)
+    ├── arc-plugins (Wasmtime WASM runtime)
+    ├── arc-config (JSON/TOML/YAML, hot reload)
+    │       ├── arc-router
+    │       ├── arc-rate-limit
+    │       └── arc-plugins
+    ├── arc-observability (metrics, admin server)
+    ├── arc-acme (ACME certificate automation)
+    ├── arc-xdp-userspace (XDP/eBPF manager)
+    ├── arc-logging (NDJSON logs, ring buffers)
+    └── arc-common (error types)
+```
+
+## Crate sizes and roles
+
+| Crate | Lines (approx.) | Role |
+|---|---|---|
+| `arc-gateway` | 13,638 | Main proxy state machine; connection lifecycle; worker loop |
+| `arc-config` | 3,141 | Config schema, compilation, ArcSwap hot reload |
+| `arc-core` | 2,184 | Shared types (`ArcConfig`, `NodeConfig`, `ListenerConfig`, …) |
+| `arc-net` | 1,642 | Raw io_uring syscall wrappers; buffer pool; socket ops |
+| `arc-router` | 1,089 | Compressed radix tree; route compilation; O(log n) matching |
+| `arc-acme` | 1,089 | ACME challenge lifecycle; TLS-ALPN-01; HTTP-01 |
+| `arc-global-rate-limit` | 904 | Two-tier rate limiter; Redis Lua backend; circuit breaker |
+| `arc-proto-http1` | 591 | HTTP/1.x request/response parser; chunked decoder |
+| `arc-proto-h2` | 542 | HTTP/2 frame parser; SETTINGS; flow control; stream state |
+| `arc-logging` | 480 | NDJSON log encoding; SPSC ring buffers; io_uring batch writes; file rotation |
+| `arc-xdp-userspace` | 420 | XDP/eBPF userspace manager; BPF map writes; dynamic threshold computation |
+| `arc-plugins` | 347 | Wasmtime integration; instance pool; `on_request` ABI |
+| `arc-observability` | 327 | `WorkerMetrics` atomic counters; admin server; `/metrics` |
+| `arc-cli` | 126 | `arc logs tail/query` CLI |
+| `arc-rate-limit` | 104 | Single-tier GCRA atomic rate limiter |
+| `arc-common` | 100 | `ArcError`, `Result` |
+
+

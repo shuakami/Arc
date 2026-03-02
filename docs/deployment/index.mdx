@@ -1,0 +1,251 @@
+---
+title: "Deployment"
+description: "This page covers how to install and run Arc in production. It includes the systemd service unit and the Kubernetes manifests."
+---
+
+## Prerequisites
+
+| Requirement | Minimum | Recommended |
+|---|---|---|
+| Linux kernel | 5.10 | 6.1+ |
+| `curl` and `sudo` | latest | latest |
+| `sha256sum` | available | from coreutils |
+| Redis (optional) | 6.0 | 7.x |
+
+Kernel 6.1+ is recommended for multishot accept and SQPOLL stability. Verify your kernel:
+
+```bash
+uname -r
+```
+
+## Install the binary
+
+### Option A (recommended): install latest release with `install.sh`
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/install.sh | sh
+arc-gateway --help
+```
+
+This script detects your architecture, downloads the latest GitHub Release binary, verifies SHA256, and installs `arc-gateway` to `/usr/local/bin/arc-gateway`.
+
+Current release assets are `arc-gateway-linux-x86_64` and `arc-gateway-linux-arm64`.
+
+## Systemd (bare metal or VM)
+
+### Install
+
+Install the service unit and default config files:
+
+```bash
+sudo install -d -m 0755 /etc/arc
+sudo curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/arc.example.json -o /etc/arc/arc.json
+sudo curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/deploy/arc-gateway.service -o /etc/systemd/system/arc-gateway.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable arc-gateway
+```
+
+The service unit expects:
+- Binary: `/usr/local/bin/arc-gateway`
+- Config file: `/etc/arc/arc.json`
+
+Edit your config, then start:
+
+```bash
+# Edit the configuration
+sudo vim /etc/arc/arc.json
+
+# Start Arc
+sudo systemctl start arc-gateway
+
+# Check status
+sudo systemctl status arc-gateway
+```
+
+### Service unit settings
+
+The service unit is installed at `/etc/systemd/system/arc-gateway.service`.
+
+| Directive | Value | Purpose |
+|---|---|---|
+| `ExecStart` | `/usr/local/bin/arc-gateway --config /etc/arc/arc.json` | Launch binary |
+| `ExecReload` | `/bin/kill -HUP $MAINPID` | Trigger hot reload |
+| `Restart` | `on-failure` | Auto-restart on crash |
+| `RestartSec` | `5s` | Backoff between restarts |
+| `TimeoutStopSec` | `35s` | Drain window before SIGKILL |
+| `WatchdogSec` | `60s` | systemd watchdog interval |
+| `LimitNOFILE` | `1048576` | Max open file descriptors |
+| `LimitNPROC` | `65536` | Max processes |
+
+Security hardening enabled by default:
+
+- `NoNewPrivileges=yes`
+- `PrivateTmp=yes`
+- `ProtectSystem=strict`
+- `ProtectHome=yes`
+- `ProtectKernelTunables=yes`
+- `ProtectControlGroups=yes`
+- `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`
+
+### Hot reload
+
+After changing `/etc/arc/arc.json`:
+
+```bash
+# via systemd
+sudo systemctl reload arc-gateway
+
+# directly
+sudo kill -HUP $(pidof arc-gateway)
+```
+
+In-flight connections are not dropped. If the new config contains changes to listener addresses, worker count, io_uring ring sizing, or control plane binding, the reload is rejected and you must restart the process instead.
+
+### Useful commands
+
+```bash
+# Follow logs
+sudo journalctl -u arc-gateway -f
+
+# Check metrics
+curl http://localhost:9090/metrics
+
+# Health check
+curl http://localhost:9090/healthz
+```
+
+---
+
+## Kubernetes
+
+All Kubernetes manifests are under `deploy/kubernetes/`. Apply them in order:
+
+```bash
+kubectl apply -f deploy/kubernetes/namespace.yaml
+kubectl apply -f deploy/kubernetes/secret.yaml
+kubectl apply -f deploy/kubernetes/configmap.yaml
+kubectl apply -f deploy/kubernetes/deployment.yaml
+kubectl apply -f deploy/kubernetes/service.yaml
+kubectl apply -f deploy/kubernetes/hpa.yaml
+```
+
+### Resources created
+
+| Resource | Details |
+|---|---|
+| Namespace | `arc-gateway` |
+| ConfigMap | `arc-gateway-config` — contains `arc.toml` |
+| Secret | `arc-gateway-secret` — contains `auth-token` |
+| Deployment | `replicas=2`, rolling update |
+| Service (ClusterIP) | Ports 8080, 8443, 9090 |
+| Service (NodePort) | Node ports 30080 (HTTP), 30443 (HTTPS) |
+| HPA | CPU-based autoscaling |
+
+### Before you apply: set the auth token
+
+The Secret must be created with an actual token before applying the Deployment:
+
+```bash
+# Edit deploy/kubernetes/secret.yaml and replace __ARC_TOKEN__
+# Then apply
+kubectl apply -f deploy/kubernetes/secret.yaml
+```
+
+Keep `control_plane.auth_token` in the ConfigMap consistent with this value.
+
+### ConfigMap key fields to override
+
+| Key | Default | Notes |
+|---|---|---|
+| `workers` | `0` (auto-detect) | Set to your pod's CPU limit for predictable performance |
+| `control_plane.auth_token` | `__ARC_TOKEN__` | Must replace |
+| `io_uring.sqpoll` | `false` | Enable for bare-metal nodes |
+| `upstreams[0].addr` | `127.0.0.1:18080` | Point to your backend |
+
+### Deployment spec
+
+| Field | Value |
+|---|---|
+| `replicas` | 2 |
+| `strategy` | RollingUpdate, `maxSurge=1`, `maxUnavailable=0` |
+| `terminationGracePeriodSeconds` | 35 |
+| HTTP port | 8080 |
+| HTTPS port | 8443 |
+| Admin port | 9090 |
+| CPU request/limit | `500m` / `2000m` |
+| Memory request/limit | `256Mi` / `1Gi` |
+
+**Liveness probe:** `GET /healthz` on port 9090, `initialDelaySeconds=5`, `periodSeconds=10`
+
+**Readiness probe:** `GET /healthz` on port 9090, `initialDelaySeconds=3`, `periodSeconds=5`
+
+### Graceful shutdown
+
+A `preStop` hook runs `sleep 5` before the container receives `SIGTERM`, giving the load balancer time to drain. `terminationGracePeriodSeconds=35` matches the drain window.
+
+### XDP/eBPF in Kubernetes
+
+XDP requires `NET_ADMIN` and `SYS_ADMIN` capabilities plus `privileged: true`. This is disabled by default in the manifests (commented out YAML). It is not compatible with most managed Kubernetes platforms.
+
+---
+
+## Startup flow (arc-daemon)
+
+Arc's startup sequence when you run `arc-gateway --config arc.yaml`:
+
+```
+main()
+  │
+  ├── load config from file
+  ├── compile config → SharedConfig
+  ├── (if control_plane.enabled) spawn control plane thread
+  │       └── axum router: /v1/status, /v1/config, /v1/cluster/*, /v1/xdp/*
+  │
+  ├── configure Pingora Server (worker count, keepalive pool)
+  ├── register HTTP proxy service (ArcProxy)
+  ├── configure listeners (HTTP/HTTPS/TCP/UDP)
+  ├── (if metrics_enabled) register Prometheus service
+  └── server.run_forever()
+```
+
+Worker count is derived from `node.workers`. If set to `0`, it uses `std::thread::available_parallelism()`.
+
+---
+
+## Production checklist
+
+Before going live:
+
+- [ ] Set `node.workers` to `0` (auto-detect) or pin to the number of CPU cores available to the process
+- [ ] Set `max_connections` to match your expected concurrent connection count
+- [ ] Configure `LimitNOFILE` in the systemd unit (default: `1048576`)
+- [ ] Enable `SO_REUSEPORT` on listeners — Arc uses it to distribute connections across worker threads without kernel lock contention
+- [ ] Configure upstream `pool.max_idle` based on your peak concurrent request rate
+- [ ] Set `control_plane.auth_token` to a strong random value if the control plane port is reachable from outside loopback
+- [ ] Bind the metrics server to loopback only (`observability.metrics_bind: "127.0.0.1:9090"`) or protect port 9090 with a firewall rule — the endpoint has no built-in authentication
+- [ ] Configure log rotation (`logging.output.rotation.max_size` and `max_files`)
+- [ ] Point Prometheus to `<host>:9090/metrics`
+- [ ] Verify hot reload works: `kill -HUP <pid>`, then check `arc_config_reload_total` increments in `/metrics`
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="systemd: Failed to start arc-gateway.service">
+Check `journalctl -xe -u arc-gateway` for the error. The most common causes are: the binary path in `ExecStart` does not exist, or the config file path is wrong. Verify with `arc-gateway --config /etc/arc/arc.json --check` (if `--check` is supported) or inspect startup logs.
+  </Accordion>
+  <Accordion title="Arc restarts in a loop with io_uring: Operation not supported">
+The kernel may not support the requested io_uring operations. Try disabling SQPOLL (`io_uring.sqpoll: false`) and reducing `uring_entries`. Required minimum: Linux 5.10.
+  </Accordion>
+  <Accordion title="Kubernetes pod stuck in CrashLoopBackOff">
+Run `kubectl logs -n arc-system <pod>`. Common causes are: `arc-gateway-secret` does not exist or `auth-token` key is missing; ConfigMap `arc.toml` references an upstream address that is not reachable at pod start; resource limits are too low and you need to increase `resources.limits.memory`.
+  </Accordion>
+  <Accordion title="bind: address already in use">
+Another process is using the port. Check with `ss -tlnp | grep 8080`. If this is a pod restart, the previous pod may not have fully terminated yet — increase `terminationGracePeriodSeconds`.
+  </Accordion>
+  <Accordion title="Hot reload (SIGHUP) is not applying changes">
+Fields such as `node.workers`, listener `bind` addresses, and `io_uring.uring_entries` require a full process restart. All others apply live. Check the `arc_config_reload_total` metric to confirm a reload fired.
+  </Accordion>
+</AccordionGroup>
+
+

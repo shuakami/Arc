@@ -1,0 +1,214 @@
+---
+title: "TLS and Certificates"
+description: "Arc terminates TLS using Rustls for all downstream connections. It supports static certificates, SNI-based selection, mTLS to upstreams, and automatic certificate issuance via ACME."
+---
+
+## Static certificates
+
+The simplest approach is to provide certificate files directly:
+
+```yaml
+listeners:
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      certificates:
+        - sni: "example.com"
+          cert_pem: /etc/arc/certs/example.com.crt
+          key_pem: /etc/arc/certs/example.com.key
+        - sni: "*.api.example.com"
+          cert_pem: /etc/arc/certs/api-wildcard.crt
+          key_pem: /etc/arc/certs/api-wildcard.key
+```
+
+Arc selects the certificate by matching the client's SNI against each entry in order. Wildcards (`*.example.com`) are supported. The first entry in the `certificates` array is used as the default when no SNI matches.
+
+Arc reads certificate files at startup and re-reads them on hot reload (SIGHUP or file watcher change).
+
+## ACME — automatic certificate management
+
+Arc can automatically obtain and renew certificates from Let's Encrypt or any ACME-compatible CA.
+
+### TLS-ALPN-01 challenge (recommended)
+
+The certificate request and challenge are handled on the HTTPS listener itself. No HTTP port or DNS access needed:
+
+```yaml
+listeners:
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      acme:
+        email: ops@example.com
+        domains: [example.com, www.example.com]
+        account_key:
+          algorithm: ed25519
+          encrypted_key_path: /etc/arc/acme-key.enc
+          passphrase:
+            type: env
+            name: ACME_KEY_PASSPHRASE
+        challenge:
+          type: tls_alpn_01
+          listener: https
+        renew_before: 720h    # 30 days before expiry
+```
+
+### HTTP-01 challenge
+
+Requires an HTTP listener on port 80:
+
+```yaml
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:80"
+  - name: https
+    kind: https
+    bind: "0.0.0.0:8443"
+    tls:
+      acme:
+        email: ops@example.com
+        domains: [example.com]
+        account_key:
+          algorithm: ed25519
+          encrypted_key_path: /etc/arc/acme-key.enc
+          passphrase:
+            type: env
+            name: ACME_KEY_PASSPHRASE
+        challenge:
+          type: http_01
+          listener: http    # must be port 80
+```
+
+### DNS-01 challenge
+
+Supports Cloudflare, Route53, RFC2136, webhook, and external command:
+
+**Cloudflare:**
+
+```yaml
+challenge:
+  type: dns_01
+  provider:
+    name: cloudflare
+    api_token: "your-cloudflare-token"
+```
+
+**Route53:**
+
+```yaml
+challenge:
+  type: dns_01
+  provider:
+    name: route53
+    access_key_id: "AKIAIOSFODNN7EXAMPLE"
+    secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    region: us-east-1
+```
+
+**External command (hook):**
+
+```yaml
+challenge:
+  type: dns_01
+  provider:
+    name: hook
+    command: /usr/local/bin/dns-challenge-hook
+    args: [--domain, "{domain}", --record, "{record}"]
+```
+
+## Account key configuration
+
+The ACME account key is stored encrypted on disk. Arc reads the passphrase from an environment variable or a file:
+
+```yaml
+account_key:
+  algorithm: ed25519         # or rsa2048
+  encrypted_key_path: /etc/arc/acme-key.enc
+  passphrase:
+    type: env
+    name: ACME_KEY_PASSPHRASE
+```
+
+or from a file:
+
+```yaml
+  passphrase:
+    type: file
+    path: /etc/arc/acme-passphrase
+```
+
+## TLS version and cipher control
+
+```yaml
+tls:
+  min_version: tls12    # or tls13
+  max_version: tls13
+  cipher_suites: []     # empty = use Rustls defaults
+  session_resumption: true
+```
+
+## mTLS to upstreams
+
+Configure mutual TLS for upstream connections by adding a `tls` block inside the upstream definition:
+
+```yaml
+upstreams:
+  - name: secure-api
+    discovery:
+      type: static
+      endpoints:
+        - address: "10.0.1.1:8443"
+    tls:
+      ca_pem: /etc/arc/certs/internal-ca.crt     # CA to verify the upstream's certificate
+      client_cert_pem: /etc/arc/certs/client.crt  # Arc's client certificate
+      client_key_pem: /etc/arc/certs/client.key   # Arc's client key
+      insecure: false                              # true = skip server cert verification (dev only)
+```
+
+When `tls` is present, Arc performs a TLS handshake with the upstream on every new connection. If `client_cert_pem` and `client_key_pem` are set, Arc presents a client certificate (mutual TLS).
+
+## SNI-based routing
+
+Arc selects the appropriate certificate based on the TLS SNI extension in the ClientHello. The matching order:
+
+1. Exact match (`example.com`)
+2. Wildcard match (`*.example.com`)
+3. Default (first certificate in the array)
+
+Rendezvous hashing across cluster nodes ensures the same domain always hits the same node during ACME challenges, preventing race conditions when multiple nodes are active.
+
+## Certificate renewal
+
+Arc tracks certificate expiry and renews before the `renew_before` threshold (default: 30 days). On renewal:
+
+1. Arc contacts the ACME CA and completes the configured challenge
+2. The new certificate is stored and activated atomically via `ArcSwap`
+3. Existing TLS connections continue using the old certificate until they close
+4. New connections use the renewed certificate immediately
+
+No process restart or hot reload is needed for certificate renewal.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="Certificate is not being served for a domain">
+Check that the `sni` field in `certificates` matches the hostname exactly, including wildcard syntax (`*.example.com`). The first certificate in the array is the default fallback when no SNI matches. Use `openssl s_client -connect localhost:8443 -servername example.com` to see which certificate Arc presents.
+  </Accordion>
+  <Accordion title="ACME: challenge validation failed">
+TLS-ALPN-01 requires port 443 to be publicly reachable and the listener `name` must match the `listener` field in `acme.challenge`. HTTP-01 requires port 80 and an `http` listener bound to that port. DNS-01 requires the DNS provider credentials to be correct and the domain's authoritative nameservers to be reachable. ACME errors are written as system log entries. Check the access log for `kind: "system"` entries.
+  </Accordion>
+  <Accordion title="Certificate not renewing automatically">
+Arc renews `renew_before` ahead of expiry (default `720h`). If the certificate is newer than `renew_before`, no renewal fires. Check `arc_tls_cert_expiry_seconds` in `/metrics` to see the time remaining. If renewal is overdue, check ACME challenge reachability.
+  </Accordion>
+  <Accordion title="TLS handshake error: no certificates configured">
+The listener kind is `https` or `h3` but no `tls.certificates` are present and `tls.acme` is not configured. Add at least one certificate entry or configure ACME.
+  </Accordion>
+  <Accordion title="mTLS to upstream: certificate verify failed">
+Ensure the upstream `tls.ca_pem` points to the correct CA bundle. If the upstream uses a self-signed certificate, add `tls.insecure: true` (use only in development).
+  </Accordion>
+</AccordionGroup>
+
+

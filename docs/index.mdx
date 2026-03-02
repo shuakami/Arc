@@ -1,0 +1,171 @@
+---
+title: "Introduction"
+description: "Arc is a Rust reverse proxy and API gateway built on io_uring for predictable, low-latency traffic handling."
+---
+
+<Note>
+Use this page as the fastest path to understand Arc, run it locally, and jump to the right document for your task.
+</Note>
+
+<Columns cols={2}>
+  <Card title="Get started in 5 minutes" icon="rocket" href="/getting-started">
+    Install and run `arc-gateway` with a minimal config.
+  </Card>
+
+  <Card title="Understand architecture" icon="diagram-project" href="/architecture">
+    Learn thread-per-core design, request flow, and crate boundaries.
+  </Card>
+
+  <Card title="Configure production behavior" icon="sliders" href="/configuration">
+    Configure listeners, routes, upstreams, plugins, and runtime options.
+  </Card>
+
+  <Card title="Operate safely" icon="shield-halved" href="/security">
+    Review limits, protections, TLS posture, and hardening guidance.
+  </Card>
+</Columns>
+
+## Why Arc
+
+Most reverse proxies rely on event-loop coordination that adds syscall and cross-thread overhead under load. Arc uses one worker per CPU core with dedicated resources, so request handling stays predictable at high concurrency.
+
+## Quick start
+
+<Steps>
+  <Step title="Install Arc">
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shuakami/Arc/master/install.sh | sh
+arc-gateway --help
+```
+
+Arc installs the latest GitHub Release binary to `/usr/local/bin/arc-gateway`.
+
+  </Step>
+
+  <Step title="Create a minimal config">
+
+```yaml
+node:
+  workers: 0
+
+listeners:
+  - name: http
+    kind: http
+    bind: "0.0.0.0:8080"
+
+upstreams:
+  - name: app
+    discovery:
+      type: static
+      endpoints:
+        - address: "127.0.0.1:3000"
+
+routes:
+  - name: root
+    match:
+      path: "/{*rest}"
+    action:
+      upstream: app
+```
+
+  </Step>
+
+  <Step title="Run Arc">
+
+```bash
+arc-gateway --config arc.yaml
+```
+
+  </Step>
+
+  <Step title="Verify expected behavior">
+
+```bash
+curl http://localhost:8080/
+curl http://localhost:9090/healthz
+curl http://localhost:9090/metrics
+```
+
+If Arc is running correctly, `:8080` proxies to your upstream, `/healthz` returns `ok`, and `/metrics` returns Prometheus text output.
+
+  </Step>
+</Steps>
+
+## Key capabilities
+
+| Capability | What you get |
+|---|---|
+| `io_uring` data plane | Low-overhead request path with fixed buffers and ring-based I/O. |
+| Thread-per-core workers | Predictable latency by avoiding cross-worker shared-state contention. |
+| HTTP/1.1 and HTTP/2 | Modern protocol coverage for common ingress and internal traffic. |
+| TLS and ACME | Rustls termination and automated certificate lifecycle workflows. |
+| WASM plugins | Request filtering and extension points without rebuilding core proxy logic. |
+| Rate limiting | Route-level and global controls for burst and abuse protection. |
+| Observability | Prometheus metrics, access logs, and tracing-friendly telemetry. |
+
+## Documentation map
+
+<Columns cols={2}>
+  <Card title="Getting started" icon="flag-checkered" href="/getting-started">
+    Install, configure, and run Arc quickly.
+  </Card>
+
+  <Card title="Deployment" icon="server" href="/deployment">
+    Run Arc on systemd, containers, or Kubernetes.
+  </Card>
+
+  <Card title="Configuration" icon="gear" href="/configuration">
+    Full reference for config fields and behavior.
+  </Card>
+
+  <Card title="Traffic management" icon="route" href="/traffic-management">
+    Routing, matching, plugins, and mirroring.
+  </Card>
+
+  <Card title="TLS and certificates" icon="lock" href="/tls-and-certificates">
+    TLS setup, certificate automation, and rotation guidance.
+  </Card>
+
+  <Card title="Security" icon="shield" href="/security">
+    Hardening, safeguards, and risk controls.
+  </Card>
+
+  <Card title="Observability" icon="chart-line" href="/observability">
+    Metrics, logs, and tracing integration.
+  </Card>
+
+  <Card title="Control plane API" icon="code" href="/control-plane-api">
+    Manage runtime behavior through HTTP endpoints.
+  </Card>
+
+  <Card title="CLI" icon="terminal" href="/cli">
+    Use operational commands for log tailing and querying.
+  </Card>
+
+  <Card title="Benchmarks" icon="gauge-high" href="/benchmarks">
+    Run and interpret performance benchmarks.
+  </Card>
+</Columns>
+
+## Internal crate layout
+
+```text
+arc-gateway            Main proxy state machine and worker lifecycle
+arc-config             Config schema, compilation, and hot reload wiring
+arc-core               Shared core types
+arc-net                io_uring wrappers, buffer pool, and socket operations
+arc-router             Route compilation and matching
+arc-acme               ACME challenge and certificate lifecycle
+arc-global-rate-limit  Cluster-aware limiting with Redis backend
+arc-proto-http1        HTTP/1.x parser and response handling
+arc-proto-h2           HTTP/2 frame, stream, and flow-control handling
+arc-plugins            Wasmtime integration and request hook ABI
+arc-observability      Metrics and admin server endpoints
+arc-logging            NDJSON log pipeline and rotation
+arc-cli                Operational CLI commands
+arc-rate-limit         Local GCRA limiter
+arc-common             Shared error and result types
+```
+
+Next step: read [Architecture](/architecture) for request flow and dependency relationships.

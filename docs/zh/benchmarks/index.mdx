@@ -1,0 +1,202 @@
+---
+title: "基准测试"
+description: "本页说明 Arc 的基准测试套件，以及如何执行与解读测试结果。"
+---
+
+## 环境要求
+
+| 工具 | 用途 |
+|---|---|
+| `wrk` | HTTP/1.1 压测工具 |
+| `h2load` | HTTP/2 压测工具（nghttp2 套件） |
+| `nginx` | 对比代理（需在 PATH 中） |
+| `python3` | 启动后端服务与解析输出 |
+| `curl` | 就绪检查 |
+| `openssl` | 生成自签证书（H2） |
+
+执行前先编译 Arc：
+
+```bash
+cargo build --release -p arc-gateway
+```
+
+---
+
+## HTTP/1.1 基准
+
+```bash
+cd benchmark
+bash scripts/run_h1_wrk_vs_nginx.sh
+```
+
+### 测试流程
+
+1. 启动 `http_ok_backend.py`（最小 Python HTTP 服务）
+2. 启动 `arc-gateway` 与 `nginx`，并都指向该后端
+3. 先执行 1 轮预热，再各执行 `RUNS` 轮 `wrk` 测量
+4. 解析结果并输出 `summary.json` 与 `summary.md`
+
+### 默认参数
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `RUNS` | `5` | 测量轮数 |
+| `THREADS` | `8` | wrk 线程数 |
+| `CONNECTIONS` | `256` | 并发连接数 |
+| `DURATION` | `30s` | 单轮测量时长 |
+| `WARMUP` | `5s` | 预热时长（不计入结果） |
+| `ARC_WORKERS` | `1` | Arc worker 线程数 |
+| `REQUIRE_ZERO_NON2XX` | `1` | 若出现非 2xx/3xx 响应则判失败 |
+
+可通过环境变量覆盖：
+
+```bash
+RUNS=10 CONNECTIONS=512 ARC_WORKERS=4 bash scripts/run_h1_wrk_vs_nginx.sh
+```
+
+---
+
+## HTTP/2 基准
+
+```bash
+cd benchmark
+bash scripts/run_h2_h2load_vs_nginx.sh
+```
+
+该脚本使用 `h2load`（而不是 `wrk`）。会自动生成一套 RSA-2048 自签证书，并同时给 Arc 与 Nginx 使用。二者都做 TLS 终止，后端仍是明文 HTTP/1.1。
+
+### 默认参数
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `RUNS` | `5` | 测量轮数 |
+| `REQUESTS` | `20000` | 每轮请求总量 |
+| `CLIENTS` | `64` | H2 并发客户端数 |
+| `STREAMS` | `20` | 单连接最大并发流 |
+| `THREADS` | `2` | h2load 线程数 |
+| `WARMUP_REQUESTS` | `1000` | 预热请求数 |
+
+---
+
+## 结果产物
+
+每次运行会在 `benchmark/results/` 下生成时间戳目录：
+
+```
+benchmark/results/h1_wrk_20260302_121530/
+  arc.json              Arc 使用的配置
+  nginx.conf            Nginx 使用的配置
+  env.txt               环境快照（见下文）
+  arc_warmup.txt        预热输出（不计入结果）
+  nginx_warmup.txt
+  arc_run1.txt          wrk/h2load 原始输出（第 1~N 轮）
+  ...
+  arc_runN.txt
+  nginx_runN.txt
+  summary.json          机器可读汇总
+  summary.md            人类可读 Markdown 表格
+  summary.stdout.json   解析脚本 stdout 副本
+  arc.out.log           Arc stdout
+  arc.err.log           Arc stderr
+  backend.log           后端日志
+  nginx.error.log       Nginx 错误日志
+```
+
+`env.txt` 会记录：
+
+| 键 | 内容 |
+|---|---|
+| `run_id` | 基于时间戳的 run 标识 |
+| `git_commit` | `git rev-parse HEAD` |
+| `uname` | 完整 `uname -a` |
+| `wrk_version` / `h2load_version` | 工具版本信息 |
+| `nginx_version` | `nginx -v` 输出 |
+| `arc_bin` | `arc-gateway` 解析后的实际路径 |
+| `params.*` | 本轮解析后的全部参数 |
+| `ports.*` | 本轮使用的端口分配 |
+
+---
+
+## 结果解读
+
+`summary.json` 会给出各测试对象跨轮次聚合统计：
+
+```json
+{
+  "arc": {
+    "requests_per_sec": {
+      "mean": 95000.0,
+      "median": 95200.0,
+      "min": 94000.0,
+      "max": 96000.0
+    },
+    "latency_avg_ms": { "median": 2.7 }
+  },
+  "nginx": {
+    "requests_per_sec": { "median": 78000.0 }
+  },
+  "compare": {
+    "arc_vs_nginx_rps_ratio_median": 1.22,
+    "arc_vs_nginx_rps_gap_pct_median": 22.0
+  }
+}
+```
+
+`summary.md` 是同一结果的表格视图，便于共享。
+
+发布对比结论时建议统一使用中位数（median）。只要同时存在 `arc` 与 `nginx` 测试结果，就会自动生成 `compare` 区块。
+
+---
+
+## 可复现性清单
+
+- 固定测试机器规格与内核版本（建议 Linux ≥ 6.1）
+- 固定 Arc 与 Nginx 构建版本（`env.txt` 会记录 commit）
+- 至少执行 5 轮（`RUNS=5`）且参数保持一致
+- 对外发布结论使用 **median**
+- 保留所有 `*_runN.txt` 原始文件
+- Arc 数据平面依赖 Linux io_uring，请在 WSL2 或原生 Linux 上测，不要在 macOS 上直接测
+- 为降低波动，建议关闭动态频率：`cpupower frequency-set -g performance`
+
+---
+
+## 测试后端
+
+`benchmark/backends/http_ok_backend.py` 是一个最小 `ThreadingHTTPServer`，返回固定大小响应，支持 `GET`、`POST`、`PUT`、`DELETE`、`HEAD`。
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--port` | required | 监听端口 |
+| `--payload-bytes` | `2` | 响应体大小（H1 默认 2，H2 默认 4096） |
+| `--delay-ms` | `0` | 每请求延迟（可模拟慢后端） |
+| `--status` | `200` | 响应状态码 |
+
+模拟更真实的响应体大小：
+
+```bash
+PAYLOAD_BYTES=4096 bash scripts/run_h1_wrk_vs_nginx.sh
+```
+
+## 故障排查
+
+<AccordionGroup>
+  <Accordion title="脚本报 command not found: wrk 或 h2load">
+安装缺失工具。Ubuntu/Debian 可用 `apt install wrk` 安装 wrk，`apt install nghttp2-client` 安装 h2load。安装后用 `wrk --version`、`h2load --version` 检查版本。
+  </Accordion>
+  <Accordion title="REQUIRE_ZERO_NON2XX check failed">
+表示测试中出现了非 2xx/3xx 响应。常见原因是 Arc/Nginx 配置错误、误触发限流、或后端未正常运行。请优先看输出目录里的 `backend.log` 和 `arc.err.log`。仅在排障时才建议 `REQUIRE_ZERO_NON2XX=0`。
+  </Accordion>
+  <Accordion title="多轮结果波动过大">
+CPU 动态频率是常见原因。可执行：
+```bash
+cpupower frequency-set -g performance
+```
+并检查是否有后台进程抢占 CPU。发布结论时请使用 `summary.json` 的中位数而非均值。
+  </Accordion>
+  <Accordion title="h2load 证书相关错误">
+H2 脚本默认使用自签证书。若 h2load 拒绝证书，请确认该版本使用的 TLS 跳过参数。脚本会自动探测 `--insecure`、`--no-verify-peer` 或 `-k`，若全部不兼容，请按实际版本补充脚本探测逻辑。
+  </Accordion>
+  <Accordion title="Arc 或 Nginx 端口冲突">
+脚本会在安全范围内随机分配端口。若仍冲突，请终止占用进程后重试，脚本会重新分配端口。
+  </Accordion>
+</AccordionGroup>

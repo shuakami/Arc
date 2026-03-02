@@ -1,0 +1,331 @@
+---
+title: "Observability"
+description: "Understanding what Arc is doing — and why a request behaved a certain way — requires three complementary data sources: counters for trends, structured logs for individual requests, and trace context to correlate spans across services. Arc provides all three without requiring an external agent."
+---
+
+Arc provides three observability subsystems: Prometheus metrics, structured NDJSON access logs, and W3C distributed tracing.
+
+---
+
+## Metrics
+
+### Configuration
+
+```yaml
+observability:
+  metrics_bind: "127.0.0.1:9090"
+  metrics_enabled: true
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/metrics` | `GET` | Prometheus text format |
+| `/healthz` | `GET` | Returns `ok` |
+
+Access control: if no `auth_token` is configured, only loopback addresses (`127.x`, `::1`) are allowed. If `auth_token` is set, the `Authorization: Bearer <token>` header is required from any IP.
+
+### Prometheus metric reference
+
+**Connection metrics:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_accepted_total` | counter | Total accepted TCP connections |
+| `arc_accept_rejected_total` | counter | Connections rejected at accept |
+| `arc_active_current` | gauge | Currently active connections |
+| `arc_closed_total` | counter | Total closed connections |
+
+**Request/response metrics:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_requests_total` | counter | Total HTTP requests received |
+| `arc_responses_total` | counter | Total HTTP responses sent |
+
+**Bandwidth:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_bytes_client_in_total` | counter | Bytes received from clients |
+| `arc_bytes_client_out_total` | counter | Bytes sent to clients |
+| `arc_bytes_upstream_in_total` | counter | Bytes received from upstreams |
+| `arc_bytes_upstream_out_total` | counter | Bytes sent to upstreams |
+
+**Phase timing** (for each of `cli_read`, `up_conn`, `up_write`, `up_read`, `cli_write`):
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_phase_time_sum_ns_<phase>` | counter | Cumulative nanoseconds in phase |
+| `arc_phase_count_<phase>` | counter | Phase observations |
+| `arc_phase_timeouts_<phase>` | counter | Phase timeout count |
+
+**io_uring health:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_ring_sq_dropped_total` | counter | Submission queue drops |
+| `arc_ring_cq_overflow_total` | counter | Completion queue overflows |
+
+> Non-zero values in `arc_ring_sq_dropped_total` or `arc_ring_cq_overflow_total` indicate the io_uring ring is too small. Increase `io_uring.uring_entries` in your configuration.
+
+**Upstream pool:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_upstream_pool_open_current` | gauge | Total open upstream connections |
+| `arc_upstream_pool_idle_current` | gauge | Idle upstream connections |
+| `arc_upstream_pool_busy_current` | gauge | In-use upstream connections |
+
+**Traffic mirroring:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_mirror_submitted_total` | counter | Mirror tasks enqueued |
+| `arc_mirror_sent_total` | counter | Mirror requests sent |
+| `arc_mirror_queue_full_total` | counter | Mirror tasks dropped (queue full) |
+| `arc_mirror_timeout_total` | counter | Mirror tasks dropped (timeout) |
+| `arc_mirror_status_2xx_total` | counter | Shadow 2xx responses |
+| `arc_mirror_latency_sum_ns` | counter | Total shadow latency |
+
+**Logging subsystem:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_log_written_total{kind=...}` | counter | Written log records by kind |
+| `arc_log_dropped_total{reason=...}` | counter | Dropped records by reason |
+| `arc_log_write_errors_total` | counter | Write failures |
+| `arc_log_buffer_depth` | gauge | Ring buffer occupancy |
+| `arc_log_write_duration_seconds` | histogram | io_uring batch write latency |
+
+**Rate limiting:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_ratelimit_rejected_total` | counter | Requests rejected by rate limiter |
+| `arc_ratelimit_circuit_open` | gauge | `1` when Redis backend circuit breaker is open |
+
+**Config and routing:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_config_reload_total` | counter | Successful hot reloads applied |
+| `arc_config_reload_error_total` | counter | Hot reloads rejected |
+| `arc_route_requests_total{route="..."}` | counter | Requests matched per named route |
+
+**TLS and plugins:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_tls_cert_expiry_seconds` | gauge | Seconds until the nearest certificate expiry |
+| `arc_plugin_timeout_total` | counter | Plugin invocations interrupted by budget timeout |
+
+**XDP:**
+
+| Metric | Type | Description |
+|---|---|---|
+| `arc_xdp_blacklisted_total` | counter | IPs added to the XDP blacklist (dynamic + manual) |
+
+### Design
+
+Workers write `AtomicU64::fetch_add` with `Ordering::Relaxed` — one instruction, no locking. `WorkerMetrics` is `#[repr(C, align(64))]` so each worker's struct occupies its own cache line. The admin server reads metric snapshots from a background thread that refreshes every 250ms.
+
+---
+
+## Access logs
+
+Arc writes structured NDJSON access logs. There is no text-format option.
+
+### Configuration
+
+```yaml
+logging:
+  output:
+    file: /var/log/arc/access.log
+    stdout: false
+    rotation:
+      max_size: 500mb
+      max_files: 30
+      compress: true
+
+  access:
+    sample: 0.01             # log 1% of requests
+    force_on_status: [401, 403, 429, 500, 502, 503, 504]
+    force_on_slow: 500       # always log requests > 500ms
+
+  redact:
+    headers: [Authorization, Cookie, X-Api-Key]
+    query_params: [token, secret, password]
+
+  writer:
+    ring_capacity: 8192      # SPSC ring buffer size per worker
+    batch_bytes: 262144      # 256 KB — flush when batch reaches this size
+    flush_interval: 50       # ms — time-based flush
+```
+
+### Log record fields
+
+Each access log line is a single JSON object:
+
+| Field | Type | Description |
+|---|---|---|
+| `ts` | string (RFC 3339, nanoseconds) | Request timestamp |
+| `level` | string | `info`, `warn`, or `error` |
+| `kind` | string | `"access"` |
+| `trace_id` | string | W3C trace ID (32 hex chars) |
+| `span_id` | string | W3C span ID (16 hex chars) |
+| `request_id` | string | Per-request unique ID |
+| `method` | string | HTTP method |
+| `path` | string | Request path |
+| `query` | string | Query string (redaction applied) |
+| `host` | string | Host header |
+| `status` | number | HTTP response status |
+| `route` | string | Matched route name |
+| `upstream` | string | Upstream group name |
+| `upstream_addr` | string | Resolved upstream address |
+| `client_ip` | string | Client remote IP |
+| `client_port` | number | Client remote port |
+| `bytes_sent` | number | Response bytes sent |
+| `bytes_received` | number | Request bytes received |
+| `duration_ms` | number | Total request duration |
+| `upstream_connect_ms` | number? | Time to upstream TCP connect |
+| `upstream_response_ms` | number? | Time to first upstream byte |
+| `attempt` | number | Retry attempt number |
+| `tls` | boolean | Whether connection used TLS |
+| `http_version` | string | `HTTP/1.1` or `HTTP/2.0` |
+
+Example:
+
+```json
+{
+  "ts": "2026-03-02T10:45:23.123456789Z",
+  "level": "info",
+  "kind": "access",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "span_id": "00f067aa0ba902b7",
+  "request_id": "01HRXYZ...",
+  "method": "GET",
+  "path": "/api/users/42",
+  "query": "",
+  "host": "api.example.com",
+  "status": 200,
+  "route": "api",
+  "upstream": "app",
+  "upstream_addr": "10.0.1.1:3000",
+  "client_ip": "203.0.113.5",
+  "client_port": 54321,
+  "bytes_sent": 1024,
+  "bytes_received": 256,
+  "duration_ms": 12,
+  "upstream_connect_ms": 1,
+  "upstream_response_ms": 8,
+  "attempt": 1,
+  "tls": true,
+  "http_version": "HTTP/2.0"
+}
+```
+
+### Redaction
+
+Arc redacts sensitive values before writing logs:
+
+- **Headers** — matched case-insensitively; values replaced with `[REDACTED]`
+- **Query parameters** — matched case-insensitively; values replaced with `[REDACTED]`
+- **Body fields** — JSONPath-style (`$.field.subfield`); values replaced with `"[REDACTED]"`
+
+Redaction rules are rebuilt automatically on hot reload.
+
+### File rotation
+
+Rotation is triggered when the active log file exceeds `max_size`. The steps are:
+
+1. Rename the active file to a timestamped archive name (near-instant metadata operation)
+2. Reopen the active path immediately so writes continue uninterrupted
+3. Compress the archive with gzip in a background thread (if `compress: true`)
+4. Delete the oldest archives to keep only `max_files` retained
+
+### Design — no backpressure on workers
+
+Workers push log events into a bounded SPSC ring buffer. If the ring is full, the event is dropped and a counter is incremented. Workers never block. The writer thread drains all rings, encodes NDJSON manually (no serde at write time), and flushes via io_uring `Write` operations in batches.
+
+---
+
+## Distributed tracing
+
+Arc implements [W3C Trace Context](https://www.w3.org/TR/trace-context/). Every request gets a `trace_id` and `span_id` that appear in access logs and are propagated to upstreams.
+
+### How trace context is resolved
+
+| Situation | Behavior |
+|---|---|
+| Incoming request has a valid `traceparent` | Parse and reuse `trace_id`; use incoming `span_id` as the parent |
+| `traceparent` is missing or malformed | Generate a fresh 128-bit `trace_id` and 64-bit `span_id` |
+| Forwarding to an upstream | Keep the same `trace_id`; generate a new `span_id` for the child span |
+| Logging | Emit `trace_id` and `span_id` as lowercase hex |
+
+### `traceparent` format
+
+Arc parses and emits the standard W3C format:
+
+```
+00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+- 2-char version (`00`)
+- 32-char trace ID (must not be all zeros)
+- 16-char span ID (must not be all zeros)
+- 2-char flags (`01` = sampled)
+
+### Upstream propagation
+
+When Arc forwards a request to an upstream, it injects a `traceparent` header with the same `trace_id` but a freshly generated `span_id`. This creates a parent-child span relationship between the Arc hop and the upstream.
+
+```
+Client → Arc:     traceparent: 00-TTTT-SSSS-01
+Arc → Upstream:   traceparent: 00-TTTT-SNEW-01   (new span ID)
+Access log:       trace_id=TTTT, span_id=SSSS     (the Arc span)
+```
+
+### Searching logs by trace ID
+
+```bash
+# Using the arc CLI
+arc logs query --trace-id 4bf92f3577b34da6a3ce929d0e0e4736
+
+# Or with jq on the log file
+grep "4bf92f3577b34da6a3ce929d0e0e4736" /var/log/arc/access.log | jq .
+```
+
+### OTLP export
+
+To export traces to an OpenTelemetry collector:
+
+```yaml
+observability:
+  tracing:
+    endpoint: "http://otel-collector:4317"
+    insecure: true    # disable TLS for the OTLP connection
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="/metrics returns 404 or connection refused">
+Check that `observability.metrics_bind` is set and that Arc is running. The default is `127.0.0.1:9090` — requests from other hosts will be refused unless you bind to `0.0.0.0:9090`. Confirm with: `curl http://127.0.0.1:9090/metrics`.
+  </Accordion>
+  <Accordion title="Access logs are not appearing">
+Verify `observability.access_log.enabled: true` and that `logging.output.file` is set to a writable path. Also check that `sample` is not set to `0.0`. Logs are written asynchronously via SPSC ring buffer — if the writer thread is behind, a short delay is normal.
+  </Accordion>
+  <Accordion title="Log file is not rotating">
+Rotation is triggered when `FileState.offset >= RotationConfig.max_size_bytes`. If the file never reaches that size, no rotation occurs. Check `arc_log_written_total` in `/metrics` to confirm bytes are being written. If compression is enabled and `arc_log_compress_dropped_total` is incrementing, the compression queue is full — reduce write rate or increase queue capacity via `ARC_LOG_COMPRESS_QUEUE_CAPACITY`.
+  </Accordion>
+  <Accordion title="OTLP traces are not appearing in the backend">
+Check that `observability.tracing.endpoint` is reachable from Arc. Set `insecure: true` if the collector does not have TLS. The `trace_id` field in access logs can be used to confirm Arc is generating trace context even if OTLP export is failing.
+  </Accordion>
+  <Accordion title="arc_worker_phase_*_seconds histograms are missing">
+Phase timing metrics are only emitted for requests that go through the full pipeline. Check that Arc is receiving and proxying traffic. If metrics appear after the first request, this is expected behavior.
+  </Accordion>
+</AccordionGroup>
+
+

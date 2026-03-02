@@ -1,0 +1,18 @@
+/* Force a compact navbar logo layout to avoid oversized brand text/logo. */
+header a[href="/"] img,
+header [class*="logo"] img {
+  max-height: 20px !important;
+  width: auto !important;
+}
+
+header a[href="/"] svg,
+header [class*="logo"] svg {
+  max-height: 20px !important;
+  width: auto !important;
+}
+
+header a[href="/"] span,
+header [class*="logo"] span {
+  font-size: 13px !important;
+  line-height: 1.1 !important;
+}
