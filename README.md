@@ -1,7 +1,5 @@
 # Arc Gateway
 
-![Arc Banner](assets/banner.png)
-
 > [!NOTE]
 > Documentation is largely complete. The project is currently in active testing.
 
