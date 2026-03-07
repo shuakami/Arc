@@ -1,15 +1,3 @@
-//! Config parsing for XDP + L7 protection.
-//!
-//! 约束：
-//! - 不修改 arc-config 的结构体：我们只从 `SharedConfig.raw_json` 中“旁路解析”出 xdp/l7_protection 节点。
-//! - 这样即使旧版本 arc-config 不认识这些字段，也不会影响 Arc 其它能力。
-//!
-//! 注意：
-//! - 这里的默认值严格按你给的 spec。
-//! - Duration 支持两种输入：
-//!   1) 字符串（humantime，例如 "1h"）
-//!   2) 数字（秒），例如 3600
-
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -89,26 +77,6 @@ fn default_slowloris_max_incomplete_conns_per_ip() -> u32 {
     1000
 }
 
-fn default_tls_flood_max_handshakes_per_ip_per_sec() -> u32 {
-    10
-}
-
-fn default_tls_flood_handshake_timeout_secs() -> u64 {
-    5
-}
-
-fn default_h2_max_concurrent_streams() -> u32 {
-    100
-}
-
-fn default_h2_max_streams_per_sec() -> u32 {
-    50
-}
-
-fn default_h2_max_rst_per_sec() -> u32 {
-    10
-}
-
 fn deserialize_duration_secs_or_humantime<'de, D>(de: D) -> Result<Duration, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -173,11 +141,6 @@ pub struct ArcSecurityConfig {
     pub l7_protection: L7ProtectionConfig,
 }
 
-/// XDP user-space config node.
-///
-/// 字段说明：
-/// - enabled: 是否启用 XDP（默认 false，避免无 root/无能力环境启动失败）
-/// - interface: 绑定网卡名；None => auto-detect
 #[derive(Debug, Deserialize, Clone)]
 pub struct XdpUserConfig {
     /// 是否启用 XDP（默认 false）。
@@ -188,10 +151,6 @@ pub struct XdpUserConfig {
     #[serde(default)]
     pub interface: Option<String>,
 
-    /// BPF pinned objects base path（默认 `/sys/fs/bpf/arc`）。
-    ///
-    /// 用途：
-    /// - 多实例同机测试时隔离 map 命名空间，避免共享同一份 blacklist。
     #[serde(default = "default_xdp_pin_base")]
     pub pin_base: String,
 
@@ -208,10 +167,6 @@ pub struct XdpUserConfig {
     #[serde(default)]
     pub auto_block: AutoBlockConfig,
 
-    /// zerocopy threshold bytes（默认 4096）。
-    ///
-    /// - 响应体 > threshold：尝试 MSG_ZEROCOPY
-    /// - <= threshold：普通 send/write
     #[serde(default = "default_zerocopy_threshold_bytes")]
     pub zerocopy_threshold_bytes: usize,
 }
@@ -280,11 +235,6 @@ pub struct SynProxyConfig {
     #[serde(default = "default_false")]
     pub enabled: bool,
 
-    /// cookie 轮转间隔（默认 1h）。
-    ///
-    /// 支持：
-    /// - "1h" 这样的字符串
-    /// - 3600 这样的整数秒
     #[serde(
         default = "default_cookie_rotation_interval",
         deserialize_with = "deserialize_duration_secs_or_humantime"
@@ -356,18 +306,12 @@ impl Default for XdpMapsConfig {
 pub struct L7ProtectionConfig {
     #[serde(default)]
     pub slowloris: SlowlorisConfig,
-    #[serde(default)]
-    pub tls_flood: TlsFloodConfig,
-    #[serde(default)]
-    pub h2_stream_flood: H2StreamFloodConfig,
 }
 
 impl Default for L7ProtectionConfig {
     fn default() -> Self {
         Self {
             slowloris: SlowlorisConfig::default(),
-            tls_flood: TlsFloodConfig::default(),
-            h2_stream_flood: H2StreamFloodConfig::default(),
         }
     }
 }
@@ -398,61 +342,6 @@ impl Default for SlowlorisConfig {
             headers_timeout_secs: default_slowloris_headers_timeout(),
             min_recv_rate_bps: default_slowloris_min_recv_rate_bps(),
             max_incomplete_conns_per_ip: default_slowloris_max_incomplete_conns_per_ip(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct TlsFloodConfig {
-    /// 是否启用（默认 true）。
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// per-IP 的 TLS 握手速率阈值（默认 10 次/s/IP）。
-    #[serde(default = "default_tls_flood_max_handshakes_per_ip_per_sec")]
-    pub max_handshakes_per_ip_per_sec: u32,
-
-    /// TLS 握手超时（秒，默认 5）。
-    #[serde(default = "default_tls_flood_handshake_timeout_secs")]
-    pub handshake_timeout_secs: u64,
-}
-
-impl Default for TlsFloodConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_handshakes_per_ip_per_sec: default_tls_flood_max_handshakes_per_ip_per_sec(),
-            handshake_timeout_secs: default_tls_flood_handshake_timeout_secs(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct H2StreamFloodConfig {
-    /// 是否启用（默认 true）。
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// 单连接并发 stream 上限（默认 100）。
-    #[serde(default = "default_h2_max_concurrent_streams")]
-    pub max_concurrent_streams: u32,
-
-    /// 单连接每秒新建 stream 速率上限（默认 50）。
-    #[serde(default = "default_h2_max_streams_per_sec")]
-    pub max_streams_per_sec: u32,
-
-    /// 单连接每秒 RST_STREAM 上限（默认 10）。
-    #[serde(default = "default_h2_max_rst_per_sec")]
-    pub max_rst_per_sec: u32,
-}
-
-impl Default for H2StreamFloodConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_concurrent_streams: default_h2_max_concurrent_streams(),
-            max_streams_per_sec: default_h2_max_streams_per_sec(),
-            max_rst_per_sec: default_h2_max_rst_per_sec(),
         }
     }
 }

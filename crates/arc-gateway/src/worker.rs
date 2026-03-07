@@ -1,20 +1,3 @@
-//! arc-gateway dataplane worker.
-//!
-//! 这是整个工程的核心数据面引擎：
-//! - thread-per-core
-//! - SO_REUSEPORT listener
-//! - io_uring accept/connect/read_fixed/write_fixed + multishot timeout tick
-//! - 单连接状态机：HTTP/1.1 request->upstream->response->client
-//! - 内置 phase timing / timeout 统计（写入 WorkerMetrics）
-//!
-//! 设计取舍：
-//! - 每个连接保持“单一 in-flight IO op”，降低 ring 压力，优先 zero-error。
-//! - header 必须在单个 fixed buffer 内完成解析（由 buf_size 控制）。
-//! - pipelining tail：支持少量 tail stash（固定大小数组），避免堆分配。
-//!
-//! 注意：
-//! - 本 worker 不使用 Mutex/RwLock；跨线程仅通过 ArcSwap(配置)与 atomics(metrics)共享。
-
 use arc_common::{ArcError, Result};
 use arc_compression::{
     decide_response_compression, encode_chunked, encode_chunked_end, AdaptiveConfig,
@@ -29,7 +12,7 @@ use arc_config::policy_compression::CompressionAlgorithm as CfgCompressionAlgori
 use arc_config::policy_timeout::parse_deadline_budget;
 use arc_config::{
     restart_required_changes, CompiledErrorPageAction, CompiledErrorPageRule,
-    CompiledRequestIdConfig, ErrorPageWhen, RateLimitPolicy, RequestIdConflictConfig,
+    CompiledRequestIdConfig, ControlRole, ErrorPageWhen, RateLimitPolicy, RequestIdConflictConfig,
     RequestIdFormatConfig, RouteAction, RouteMatcher, SharedConfig, TrustedProxyCidr,
 };
 use arc_global_rate_limit::{Policy as GlobalRatePolicy, WorkerLimiter as GlobalWorkerLimiter};
@@ -109,6 +92,14 @@ const RESP_504: &[u8] =
 const MAX_TRIED_UPSTREAMS: usize = 8;
 const AUTO_BLOCK_GC_INTERVAL_NS: u64 = 1_000_000_000;
 const AUTO_BLOCK_KEEP_NS_FLOOR: u64 = 5_000_000_000;
+#[inline]
+fn cluster_mode_configured(cfg: &SharedConfig) -> bool {
+    let cp = &cfg.control_plane;
+    cp.enabled
+        && (!cp.peers.is_empty()
+            || !matches!(cp.role, ControlRole::Standalone)
+            || cp.pull_from.is_some())
+}
 
 #[derive(Clone)]
 struct AutoBlockPolicy {
@@ -712,6 +703,10 @@ enum H2H1TaskState {
     ReadingResp,
 }
 
+#[inline]
+fn h2_log_timing(_stream_id: u32, _phase_name: &str, _started_ns: u64) {
+}
+
 struct H2H1Task {
     down: H2ConnKey,
     sid: u32,
@@ -727,6 +722,8 @@ struct H2H1Task {
 
     req: Vec<u8>,
     req_sent: usize,
+    req_keepalive: bool,
+    resp_keepalive: bool,
     resp: Vec<u8>,
 
     status: u16,
@@ -738,14 +735,13 @@ struct H2H1Task {
     deadline_ns: u64,
     started_ns: u64,
     connect_done_ns: Option<u64>,
-    access_log: AccessLogSnapshot,
+    access_log: Option<AccessLogSnapshot>,
     response_header_muts: Arc<[CompiledHeaderMutation]>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum H2DispatchError {
-    RefusedStream,
-    Failed,
+    RefusedStream(Option<AccessLogSnapshot>),
+    Failed(Option<AccessLogSnapshot>),
 }
 
 #[derive(Debug, Clone)]
@@ -895,6 +891,7 @@ pub struct Worker {
     auto_block_counters: HashMap<u64, AutoBlockCounter>,
     auto_block_last_gc_ns: u64,
     cluster_circuit: Arc<ClusterCircuit>,
+    cluster_circuit_hot_enabled: bool,
     shutdown: Arc<AtomicBool>,
     drained_workers: Arc<AtomicUsize>,
     graceful_shutdown_timeout: Duration,
@@ -902,6 +899,8 @@ pub struct Worker {
     drain_reported: bool,
     accepting: bool,
     should_exit: bool,
+    access_log_hot_enabled: bool,
+    access_log_hot_next_refresh_ns: u64,
 
     accept_multishot: bool,
     tick_multishot: bool,
@@ -1018,6 +1017,42 @@ impl Worker {
         let decision = guard.on_conn_start(ip_hash);
         conn.slowloris_tracking = matches!(decision, SlowlorisDecision::Allow);
         decision
+    }
+
+    #[inline]
+    fn slowloris_rebind_client_ip(
+        guard: Option<&SlowlorisGuard>,
+        conn: &mut Conn,
+        effective_client_ip: &str,
+    ) -> SlowlorisDecision {
+        if effective_client_ip.is_empty() || conn.client_ip == effective_client_ip {
+            return SlowlorisDecision::Allow;
+        }
+
+        let prev_hash = conn.slowloris_ip_hash;
+        let prev_tracking = conn.slowloris_tracking;
+        let next_hash = Self::slowloris_ip_hash(effective_client_ip);
+
+        if prev_tracking {
+            if let Some(guard) = guard {
+                if prev_hash != 0 {
+                    guard.on_conn_end(prev_hash);
+                }
+                let decision = guard.on_conn_start(next_hash);
+                if !matches!(decision, SlowlorisDecision::Allow) {
+                    // Revert counter so this connection keeps the original tracking key.
+                    if prev_hash != 0 {
+                        let _ = guard.on_conn_start(prev_hash);
+                    }
+                    return decision;
+                }
+            }
+        }
+
+        conn.client_ip.clear();
+        conn.client_ip.push_str(effective_client_ip);
+        conn.slowloris_ip_hash = next_hash;
+        SlowlorisDecision::Allow
     }
 
     #[inline]
@@ -1182,6 +1217,9 @@ impl Worker {
 
     #[inline]
     fn mark_upstream_failure(&self, upstream_id: usize) {
+        if !self.cluster_circuit_hot_enabled {
+            return;
+        }
         if let Some(up) = self.active_cfg.upstreams.get(upstream_id) {
             self.cluster_circuit.record_failure(up.addr);
         }
@@ -1189,6 +1227,9 @@ impl Worker {
 
     #[inline]
     fn mark_upstream_success(&self, upstream_id: usize) {
+        if !self.cluster_circuit_hot_enabled {
+            return;
+        }
         if let Some(up) = self.active_cfg.upstreams.get(upstream_id) {
             self.cluster_circuit.record_success(up.addr);
         }
@@ -1196,6 +1237,9 @@ impl Worker {
 
     #[inline]
     fn upstream_circuit_open(&self, upstream_id: usize) -> bool {
+        if !self.cluster_circuit_hot_enabled {
+            return false;
+        }
         self.active_cfg
             .upstreams
             .get(upstream_id)
@@ -1530,6 +1574,7 @@ impl Worker {
             auto_block_counters: HashMap::new(),
             auto_block_last_gc_ns: 0,
             cluster_circuit,
+            cluster_circuit_hot_enabled: cluster_mode_configured(cfg.as_ref()),
             shutdown,
             drained_workers,
             graceful_shutdown_timeout,
@@ -1537,6 +1582,8 @@ impl Worker {
             drain_reported: false,
             accepting: true,
             should_exit: false,
+            access_log_hot_enabled: arc_logging::access_log_hot_path_enabled(),
+            access_log_hot_next_refresh_ns: now_ns.saturating_add(10_000_000),
 
             accept_multishot: cfg.io_uring.accept_multishot,
             tick_multishot: false,
@@ -1781,6 +1828,10 @@ impl Worker {
         // idle upstream liveness is maintained passively by epoll events.
         self.drain_idle_epoll()?;
         let now_ns = monotonic_nanos();
+        if now_ns >= self.access_log_hot_next_refresh_ns {
+            self.access_log_hot_enabled = arc_logging::access_log_hot_path_enabled();
+            self.access_log_hot_next_refresh_ns = now_ns.saturating_add(10_000_000);
+        }
         self.refresh_upstream_dns(now_ns);
         self.refresh_upstream_pool_metrics(now_ns);
 
@@ -1825,6 +1876,7 @@ impl Worker {
                 new_cfg.cluster_circuit.half_open_probe_interval_ms.max(1),
             );
         }
+        self.cluster_circuit_hot_enabled = cluster_mode_configured(new_cfg.as_ref());
 
         // close all idle upstream first (also release fixed-file slots)
         self.idle_gc.clear();
@@ -3195,7 +3247,7 @@ impl Worker {
         out.extend_from_slice(b"content-length: ");
         out.extend_from_slice(body.len().to_string().as_bytes());
         out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(b"connection: close\r\n\r\n");
+        out.extend_from_slice(b"connection: keep-alive\r\n\r\n");
         out.extend_from_slice(body);
         out
     }
@@ -3898,7 +3950,7 @@ impl Worker {
     }
 
     fn h2_release_task_resources(&mut self, task_key: Key) -> Option<(H2ConnKey, usize)> {
-        let (down, upstream_id, fd, fi, io_buf) = {
+        let (down, upstream_id, fd, fi, io_buf, req_keepalive, resp_keepalive) = {
             let task = self.h2_tasks.get_mut(task_key)?;
             (
                 task.down,
@@ -3906,17 +3958,32 @@ impl Worker {
                 task.upstream_fd,
                 task.upstream_fi,
                 task.io_buf,
+                task.req_keepalive,
+                task.resp_keepalive,
             )
         };
 
-        if fd >= 0 {
-            close_fd_graceful(fd, self.active_cfg.linger_ms);
-            self.upstream_release_connection_slot(upstream_id);
-        }
-        if fi >= 0 {
-            let slot = fi as u32;
-            let _ = self.uring.update_files(slot, &[-1]);
-            self.files.free_slot(slot);
+        if should_checkin_upstream_keepalive(req_keepalive, resp_keepalive, fd, fi) {
+            self.checkin_idle_upstream(
+                upstream_id,
+                IdleUpstream {
+                    fd,
+                    fi,
+                    upstream_id,
+                    ts_ns: monotonic_nanos(),
+                    watch_tag: 0,
+                },
+            );
+        } else {
+            if fd >= 0 {
+                close_fd_graceful(fd, self.active_cfg.linger_ms);
+                self.upstream_release_connection_slot(upstream_id);
+            }
+            if fi >= 0 {
+                let slot = fi as u32;
+                let _ = self.uring.update_files(slot, &[-1]);
+                self.files.free_slot(slot);
+            }
         }
         if io_buf != INVALID_BUF {
             self.bufs.free(io_buf);
@@ -4545,15 +4612,15 @@ impl Worker {
         upstream_id: usize,
         req: Vec<u8>,
         started_ns: u64,
-        access_log: AccessLogSnapshot,
+        mut access_log: Option<AccessLogSnapshot>,
         response_header_muts: Arc<[CompiledHeaderMutation]>,
     ) -> std::result::Result<(), H2DispatchError> {
         if upstream_id >= self.h2_up_inflight.len() {
-            return Err(H2DispatchError::Failed);
+            return Err(H2DispatchError::Failed(access_log));
         }
         let limit = self.h2_up_limit();
         if self.h2_active_inflight() >= limit {
-            return Err(H2DispatchError::RefusedStream);
+            return Err(H2DispatchError::RefusedStream(access_log));
         }
 
         self.h2_up_inflight[upstream_id] = self.h2_up_inflight[upstream_id].saturating_add(1);
@@ -4564,13 +4631,13 @@ impl Worker {
                 upstream_id,
                 req,
                 started_ns,
-                access_log,
+                &mut access_log,
                 response_header_muts,
             )
             .is_err()
         {
             self.h2_up_inflight[upstream_id] = self.h2_up_inflight[upstream_id].saturating_sub(1);
-            return Err(H2DispatchError::Failed);
+            return Err(H2DispatchError::Failed(access_log));
         }
         Ok(())
     }
@@ -5678,7 +5745,7 @@ impl Worker {
                 task.sid,
                 task.upstream_id,
                 task.started_ns,
-                task.access_log.clone(),
+                task.access_log.take(),
             ),
             None => return Ok(()),
         };
@@ -5687,7 +5754,7 @@ impl Worker {
             self.mark_upstream_failure(upstream_id);
         }
         self.h2_send_status_only(down, sid, status);
-        Self::h2_emit_access_log(access_log, status, started_ns);
+        Self::h2_emit_access_log_opt(access_log, status, started_ns);
         self.h2_cleanup_task(task_key);
         self.h2_try_flush_downstream(down)?;
         Ok(())
@@ -5832,15 +5899,18 @@ impl Worker {
             let head =
                 parse_response_head(&task.resp, hend).map_err(|_| H2H1RoundtripError::Proto)?;
             task.status = head.status;
+            task.resp_keepalive = head.keepalive;
             task.head_end = Some(hend);
             task.body_kind = Some(head.body);
-            if task.access_log.upstream_response_ms.is_none() {
-                let base_ns = task.connect_done_ns.unwrap_or(task.started_ns);
-                task.access_log.upstream_response_ms = Some(
-                    monotonic_nanos()
-                        .saturating_sub(base_ns)
-                        .saturating_div(1_000_000),
-                );
+            if let Some(log) = task.access_log.as_mut() {
+                if log.upstream_response_ms.is_none() {
+                    let base_ns = task.connect_done_ns.unwrap_or(task.started_ns);
+                    log.upstream_response_ms = Some(
+                        monotonic_nanos()
+                            .saturating_sub(base_ns)
+                            .saturating_div(1_000_000),
+                    );
+                }
             }
         }
 
@@ -5894,9 +5964,10 @@ impl Worker {
         upstream_id: usize,
         req: Vec<u8>,
         started_ns: u64,
-        access_log: AccessLogSnapshot,
+        access_log: &mut Option<AccessLogSnapshot>,
         response_header_muts: Arc<[CompiledHeaderMutation]>,
     ) -> Result<()> {
+        h2_log_timing(sid, "upstream_connect_or_reuse_start", started_ns);
         let Some(_up) = self.active_cfg.upstreams.get(upstream_id) else {
             return Err(ArcError::config(
                 "invalid upstream id for h2 stream".to_string(),
@@ -5905,47 +5976,69 @@ impl Worker {
         let up_addr = self
             .upstream_runtime_addr(upstream_id)
             .ok_or_else(|| ArcError::config("invalid runtime upstream addr".to_string()))?;
-        if !self.upstream_try_acquire_connection_slot(upstream_id) {
-            return Err(ArcError::internal("upstream max_connections reached"));
-        }
+        let now_ns = monotonic_nanos();
+        let (reused_idle, upstream_fd, upstream_fi, connect_done_ns) =
+            if let Some(idle) = self.checkout_idle_upstream(upstream_id, now_ns) {
+                (true, idle.fd, idle.fi, Some(now_ns))
+            } else {
+                if !self.upstream_try_acquire_connection_slot(upstream_id) {
+                    return Err(ArcError::internal("upstream max_connections reached"));
+                }
 
-        let upstream_fd = match net::create_client_socket(&up_addr) {
-            Ok(fd) => fd,
-            Err(e) => {
-                self.upstream_release_connection_slot(upstream_id);
-                return Err(ArcError::io("h2 stream socket", e));
-            }
-        };
-        if self.active_cfg.linger_ms > 0 {
-            let _ = net::set_linger(upstream_fd, self.active_cfg.linger_ms);
-        }
+                let upstream_fd = match net::create_client_socket(&up_addr) {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        self.upstream_release_connection_slot(upstream_id);
+                        return Err(ArcError::io("h2 stream socket", e));
+                    }
+                };
+                if self.active_cfg.linger_ms > 0 {
+                    let _ = net::set_linger(upstream_fd, self.active_cfg.linger_ms);
+                }
 
-        let up_slot = match self.files.alloc() {
-            Some(s) => s,
-            None => {
-                close_fd(upstream_fd);
-                self.upstream_release_connection_slot(upstream_id);
-                return Err(ArcError::internal(
-                    "no fixed-file slot for h2 stream upstream",
-                ));
-            }
-        };
+                let up_slot = match self.files.alloc() {
+                    Some(s) => s,
+                    None => {
+                        close_fd(upstream_fd);
+                        self.upstream_release_connection_slot(upstream_id);
+                        return Err(ArcError::internal(
+                            "no fixed-file slot for h2 stream upstream",
+                        ));
+                    }
+                };
 
-        self.files.table[up_slot as usize] = upstream_fd;
-        if let Err(e) = self.uring.update_files(up_slot, &[upstream_fd]) {
-            self.files.free_slot(up_slot);
-            close_fd(upstream_fd);
-            self.upstream_release_connection_slot(upstream_id);
-            return Err(ArcError::io("update_files(h2 stream upstream)", e));
-        }
+                self.files.table[up_slot as usize] = upstream_fd;
+                if let Err(e) = self.uring.update_files(up_slot, &[upstream_fd]) {
+                    self.files.free_slot(up_slot);
+                    close_fd(upstream_fd);
+                    self.upstream_release_connection_slot(upstream_id);
+                    return Err(ArcError::io("update_files(h2 stream upstream)", e));
+                }
+                (false, upstream_fd, up_slot as i32, None)
+            };
 
         let io_buf = match self.bufs.alloc() {
             Some(b) => b,
             None => {
-                let _ = self.uring.update_files(up_slot, &[-1]);
-                self.files.free_slot(up_slot);
-                close_fd(upstream_fd);
-                self.upstream_release_connection_slot(upstream_id);
+                if reused_idle {
+                    self.drop_idle_upstream(IdleUpstream {
+                        fd: upstream_fd,
+                        fi: upstream_fi,
+                        upstream_id,
+                        ts_ns: now_ns,
+                        watch_tag: 0,
+                    });
+                } else {
+                    if upstream_fi >= 0 {
+                        let slot = upstream_fi as u32;
+                        let _ = self.uring.update_files(slot, &[-1]);
+                        self.files.free_slot(slot);
+                    }
+                    if upstream_fd >= 0 {
+                        close_fd(upstream_fd);
+                        self.upstream_release_connection_slot(upstream_id);
+                    }
+                }
                 return Err(ArcError::internal("no fixed buffer for h2 stream upstream"));
             }
         };
@@ -5954,36 +6047,63 @@ impl Worker {
             Some(k) => k,
             None => {
                 self.bufs.free(io_buf);
-                let _ = self.uring.update_files(up_slot, &[-1]);
-                self.files.free_slot(up_slot);
-                close_fd(upstream_fd);
-                self.upstream_release_connection_slot(upstream_id);
+                if reused_idle {
+                    self.drop_idle_upstream(IdleUpstream {
+                        fd: upstream_fd,
+                        fi: upstream_fi,
+                        upstream_id,
+                        ts_ns: now_ns,
+                        watch_tag: 0,
+                    });
+                } else {
+                    if upstream_fi >= 0 {
+                        let slot = upstream_fi as u32;
+                        let _ = self.uring.update_files(slot, &[-1]);
+                        self.files.free_slot(slot);
+                    }
+                    if upstream_fd >= 0 {
+                        close_fd(upstream_fd);
+                        self.upstream_release_connection_slot(upstream_id);
+                    }
+                }
                 return Err(ArcError::internal("h2 stream task slab exhausted"));
             }
         };
+
+        if reused_idle {
+            if let Some(log) = access_log.as_mut() {
+                log.upstream_connect_ms = Some(0);
+            }
+        }
 
         let task = H2H1Task {
             down,
             sid,
             upstream_id,
             upstream_fd,
-            upstream_fi: up_slot as i32,
+            upstream_fi,
             upstream_sa: net::SockAddr::from_socket_addr(&up_addr),
             io_buf,
             io_len: 0,
             io_off: 0,
             req,
             req_sent: 0,
+            req_keepalive: true,
+            resp_keepalive: false,
             resp: Vec::with_capacity(8192),
             status: 502,
             head_end: None,
             body_kind: None,
             saw_eof: false,
-            state: H2H1TaskState::Connecting,
+            state: if reused_idle {
+                H2H1TaskState::WritingReq
+            } else {
+                H2H1TaskState::Connecting
+            },
             deadline_ns: 0,
             started_ns,
-            connect_done_ns: None,
-            access_log,
+            connect_done_ns,
+            access_log: access_log.take(),
             response_header_muts,
         };
         unsafe {
@@ -5995,6 +6115,24 @@ impl Worker {
             .or_default()
             .push(task_key);
         self.h2_down_pending_inc(down);
+
+        if reused_idle {
+            h2_log_timing(sid, "upstream_connect_or_reuse_done", started_ns);
+            let schedule = if !self.h2_task_prepare_next_write_chunk(task_key)? {
+                self.h2_schedule_task_read(task_key)
+            } else {
+                let len = match self.h2_tasks.get_mut(task_key) {
+                    Some(task) => task.io_len,
+                    None => return Ok(()),
+                };
+                self.h2_schedule_task_write(task_key, 0, len)
+            };
+            if let Err(e) = schedule {
+                let _ = self.h2_fail_task(task_key, 503);
+                return Err(e);
+            }
+            return Ok(());
+        }
 
         if let Err(e) = self.h2_schedule_task_connect(task_key) {
             let _ = self.h2_fail_task(task_key, 503);
@@ -6020,12 +6158,19 @@ impl Worker {
         }
 
         let now = monotonic_nanos();
+        let mut timing_log: Option<(u32, u64)> = None;
         if let Some(task) = self.h2_tasks.get_mut(task_key) {
             task.connect_done_ns = Some(now);
-            task.access_log.upstream_connect_ms = Some(
-                now.saturating_sub(task.started_ns)
-                    .saturating_div(1_000_000),
-            );
+            if let Some(log) = task.access_log.as_mut() {
+                log.upstream_connect_ms = Some(
+                    now.saturating_sub(task.started_ns)
+                        .saturating_div(1_000_000),
+                );
+            }
+            timing_log = Some((task.sid, task.started_ns));
+        }
+        if let Some((sid, started_ns)) = timing_log {
+            h2_log_timing(sid, "upstream_connect_or_reuse_done", started_ns);
         }
 
         let _ = fi;
@@ -6062,6 +6207,7 @@ impl Worker {
         let mut need_continue_chunk = false;
         let mut need_next_chunk = false;
         let mut finished_req = false;
+        let mut finished_req_log: Option<(u32, u64)> = None;
         let mut next_off = 0u32;
         let mut next_len = 0u32;
         {
@@ -6081,6 +6227,7 @@ impl Worker {
                     need_next_chunk = true;
                 } else {
                     finished_req = true;
+                    finished_req_log = Some((task.sid, task.started_ns));
                 }
             }
         }
@@ -6101,6 +6248,9 @@ impl Worker {
         }
 
         if finished_req {
+            if let Some((sid, started_ns)) = finished_req_log {
+                h2_log_timing(sid, "upstream_request_sent", started_ns);
+            }
             return self.h2_schedule_task_read(task_key);
         }
 
@@ -6151,15 +6301,18 @@ impl Worker {
                             task.sid,
                             task.upstream_id,
                             task.started_ns,
-                            task.access_log.clone(),
+                            task.access_log.take(),
                         ),
                         None => return Ok(()),
                     };
                 self.mark_upstream_success(upstream_id);
+                h2_log_timing(sid, "upstream_response_ready", started_ns);
+                h2_log_timing(sid, "downstream_response_emit", started_ns);
                 self.h2_send_full_response(down, sid, status, headers, body);
-                Self::h2_emit_access_log(access_log, status, started_ns);
+                Self::h2_emit_access_log_opt(access_log, status, started_ns);
                 self.h2_cleanup_task(task_key);
                 self.h2_try_flush_downstream(down)?;
+                h2_log_timing(sid, "downstream_response_flushed", started_ns);
                 Ok(())
             }
             Ok(None) => {
@@ -6200,8 +6353,10 @@ impl Worker {
         } else {
             None
         };
+        let access_log_enabled = self.access_log_hot_enabled;
         for (sid, head, body_parts) in collector.take_ready() {
             let started_ns = monotonic_nanos();
+            h2_log_timing(sid, "downstream_request_ready", started_ns);
             let path = head.path.as_ref().map(|p| p.as_ref()).unwrap_or(b"/");
             let method = head.method.as_ref();
 
@@ -6242,18 +6397,22 @@ impl Worker {
             let route_name =
                 String::from_utf8_lossy(self.active_cfg.routes[route_id as usize].path.as_ref())
                     .into_owned();
-            let mut access_log = self.h2_make_access_log_snapshot(
-                down_key,
-                sid,
-                now_ns,
-                trace_ctx,
-                method_for_log,
-                path,
-                host_for_log,
-                route_name.as_str(),
-                "",
-                "",
-            );
+            let mut access_log = if access_log_enabled {
+                Some(self.h2_make_access_log_snapshot(
+                    down_key,
+                    sid,
+                    now_ns,
+                    trace_ctx,
+                    method_for_log,
+                    path,
+                    host_for_log,
+                    route_name.as_str(),
+                    "",
+                    "",
+                ))
+            } else {
+                None
+            };
 
             let (
                 limiter,
@@ -6287,7 +6446,9 @@ impl Worker {
                 request_id_from_client,
                 &request_id_cfg,
             );
-            access_log.request_id = request_id_decision.value.clone();
+            if let Some(log) = access_log.as_mut() {
+                log.request_id = request_id_decision.value.clone();
+            }
             let mut forwarded_identity = None;
             let client_ip_for_rl = if forwarded_for {
                 let identity = resolve_forwarded_identity(
@@ -6314,7 +6475,7 @@ impl Worker {
                 self.on_route_rate_limited(route_id, client_ip_for_rl.as_str(), now_ns);
                 self.h2_release_body_parts(body_parts);
                 let _ = down.send_response_headers(sid, 429, vec![], true);
-                Self::h2_emit_access_log(access_log.clone(), 429, started_ns);
+                Self::h2_emit_access_log_opt(access_log.take(), 429, started_ns);
                 continue;
             }
 
@@ -6331,7 +6492,7 @@ impl Worker {
                 if let Some(code) = denied {
                     self.h2_release_body_parts(body_parts);
                     let _ = down.send_response_headers(sid, code, vec![], true);
-                    Self::h2_emit_access_log(access_log.clone(), code, started_ns);
+                    Self::h2_emit_access_log_opt(access_log.take(), code, started_ns);
                     continue;
                 }
             }
@@ -6356,7 +6517,7 @@ impl Worker {
                 } else {
                     self.h2_send_full_response_on_down(down, sid, *status, headers, h2_body);
                 }
-                Self::h2_emit_access_log(access_log.clone(), *status, started_ns);
+                Self::h2_emit_access_log_opt(access_log.take(), *status, started_ns);
                 continue;
             }
 
@@ -6390,26 +6551,28 @@ impl Worker {
             let Some(upstream_id) = upstream_id else {
                 self.h2_release_body_parts(body_parts);
                 let _ = down.send_response_headers(sid, 503, vec![], true);
-                Self::h2_emit_access_log(access_log.clone(), 503, started_ns);
+                Self::h2_emit_access_log_opt(access_log.take(), 503, started_ns);
                 continue;
             };
             let Some(upstream_addr) = self.upstream_runtime_addr(upstream_id) else {
                 self.h2_release_body_parts(body_parts);
                 let _ = down.send_response_headers(sid, 503, vec![], true);
-                Self::h2_emit_access_log(access_log.clone(), 503, started_ns);
+                Self::h2_emit_access_log_opt(access_log.take(), 503, started_ns);
                 continue;
             };
 
             if let Some(upstream) = self.active_cfg.upstreams.get(upstream_id) {
-                access_log.upstream = upstream.name.as_ref().to_string();
-                access_log.upstream_addr = upstream_addr.to_string();
+                if let Some(log) = access_log.as_mut() {
+                    log.upstream = upstream.name.as_ref().to_string();
+                    log.upstream_addr = upstream_addr.to_string();
+                }
             }
 
             let body = match self.h2_collect_body_bytes(body_parts, 8 * 1024 * 1024) {
                 Ok(v) => v,
                 Err(_) => {
                     let _ = down.send_response_headers(sid, 413, vec![], true);
-                    Self::h2_emit_access_log(access_log.clone(), 413, started_ns);
+                    Self::h2_emit_access_log_opt(access_log.take(), 413, started_ns);
                     continue;
                 }
             };
@@ -6422,7 +6585,7 @@ impl Worker {
                 traceparent.as_str(),
                 forwarded_identity.as_ref(),
                 request_id_cfg.header.as_ref(),
-                access_log.request_id.as_str(),
+                request_id_decision.value.as_str(),
                 request_id_decision.force_set,
                 request_id_decision.original.as_deref(),
             );
@@ -6432,9 +6595,10 @@ impl Worker {
                 .and_then(|v| v.as_ref())
                 .is_some()
             {
+                h2_log_timing(sid, "upstream_connect_or_reuse_start", started_ns);
                 if !self.upstream_try_acquire_connection_slot(upstream_id) {
                     let _ = down.send_response_headers(sid, 503, vec![], true);
-                    Self::h2_emit_access_log(access_log.clone(), 503, started_ns);
+                    Self::h2_emit_access_log_opt(access_log.take(), 503, started_ns);
                     continue;
                 }
                 let roundtrip = self.h2_roundtrip_h1(upstream_id, upstream_addr, &req);
@@ -6446,20 +6610,25 @@ impl Worker {
                             &mut headers,
                             response_header_muts.as_ref(),
                         );
-                        access_log.upstream_connect_ms = Some(connect_ms);
-                        access_log.upstream_response_ms = response_ms;
+                        if let Some(log) = access_log.as_mut() {
+                            log.upstream_connect_ms = Some(connect_ms);
+                            log.upstream_response_ms = response_ms;
+                        }
+                        h2_log_timing(sid, "upstream_response_ready", started_ns);
+                        h2_log_timing(sid, "downstream_response_emit", started_ns);
                         self.h2_send_full_response_on_down(down, sid, status, headers, &body);
-                        Self::h2_emit_access_log(access_log.clone(), status, started_ns);
+                        h2_log_timing(sid, "downstream_response_flushed", started_ns);
+                        Self::h2_emit_access_log_opt(access_log.take(), status, started_ns);
                     }
                     Err(H2H1RoundtripError::Timeout) => {
                         self.mark_upstream_failure(upstream_id);
                         let _ = down.send_response_headers(sid, 504, vec![], true);
-                        Self::h2_emit_access_log(access_log.clone(), 504, started_ns);
+                        Self::h2_emit_access_log_opt(access_log.take(), 504, started_ns);
                     }
                     Err(_) => {
                         self.mark_upstream_failure(upstream_id);
                         let _ = down.send_response_headers(sid, 502, vec![], true);
-                        Self::h2_emit_access_log(access_log.clone(), 502, started_ns);
+                        Self::h2_emit_access_log_opt(access_log.take(), 502, started_ns);
                     }
                 }
                 continue;
@@ -6470,21 +6639,21 @@ impl Worker {
                 upstream_id,
                 req,
                 started_ns,
-                access_log.clone(),
+                access_log,
                 response_header_muts,
             ) {
                 Ok(()) => {}
-                Err(H2DispatchError::RefusedStream) => {
+                Err(H2DispatchError::RefusedStream(access_log)) => {
                     match self.active_cfg.http2.overflow_action {
                         arc_config::Http2OverflowActionConfig::RstRefused => {
                             let _ = down.send_rst_stream(sid, H2Code::RefusedStream);
                         }
                     }
-                    Self::h2_emit_access_log(access_log, 503, started_ns);
+                    Self::h2_emit_access_log_opt(access_log, 503, started_ns);
                 }
-                Err(H2DispatchError::Failed) => {
+                Err(H2DispatchError::Failed(access_log)) => {
                     let _ = down.send_response_headers(sid, 503, vec![], true);
-                    Self::h2_emit_access_log(access_log, 503, started_ns);
+                    Self::h2_emit_access_log_opt(access_log, 503, started_ns);
                 }
             }
         }
@@ -6912,7 +7081,7 @@ impl Worker {
                 conn.upstream_connect_ms = None;
                 conn.upstream_response_ms = None;
                 conn.upstream_connect_done_ns = 0;
-                conn.log_active = true;
+                conn.log_active = self.access_log_hot_enabled;
                 conn.log_trace_id = trace_ctx.trace_id_hex();
                 conn.log_span_id = trace_ctx.span_id_hex();
                 conn.log_traceparent = traceparent;
@@ -6993,6 +7162,18 @@ impl Worker {
                 } else {
                     peer_client_ip.clone()
                 };
+                if let Some(conn) = self.conns.get_mut(key) {
+                    let decision = Self::slowloris_rebind_client_ip(
+                        self.slowloris_guard.as_ref(),
+                        conn,
+                        client_ip_for_rl.as_str(),
+                    );
+                    if !matches!(decision, SlowlorisDecision::Allow) {
+                        let _ = conn;
+                        self.close_conn(key);
+                        return Ok(());
+                    }
+                }
 
                 // rate limit (global if enabled, otherwise fallback to local limiter)
                 if !Self::allow_route_rate_limit(
@@ -8565,6 +8746,13 @@ impl Worker {
         Self::emit_access_log_snapshot(s);
     }
 
+    #[inline]
+    fn h2_emit_access_log_opt(s: Option<AccessLogSnapshot>, status: u16, started_ns: u64) {
+        if let Some(s) = s {
+            Self::h2_emit_access_log(s, status, started_ns);
+        }
+    }
+
     fn h2_make_access_log_snapshot(
         &mut self,
         down_key: Key,
@@ -10022,30 +10210,80 @@ fn host_matches_any(host: &[u8], patterns: &[Bytes]) -> bool {
 }
 
 fn http1_header_value<'a>(head_block: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    if name.is_empty() || head_block.is_empty() {
+        return None;
+    }
+
+    let len = head_block.len();
+    let name_len = name.len();
+
+    // Skip request/status line.
     let mut pos = 0usize;
-    let mut first_line = true;
-    while pos < head_block.len() {
-        let mut end = pos;
-        while end < head_block.len() && head_block[end] != b'\n' {
-            end += 1;
-        }
-        let mut line = &head_block[pos..end];
-        if line.last() == Some(&b'\r') {
-            line = &line[..line.len().saturating_sub(1)];
-        }
-        if first_line {
-            first_line = false;
-        } else if line.is_empty() {
+    while pos < len && head_block[pos] != b'\n' {
+        pos += 1;
+    }
+    if pos < len {
+        pos += 1;
+    } else {
+        return None;
+    }
+
+    while pos < len {
+        // Empty line means end of headers.
+        if head_block[pos] == b'\n' {
             break;
-        } else if let Some(colon) = line.iter().position(|b| *b == b':') {
-            let n = &line[..colon];
-            if n.eq_ignore_ascii_case(name) {
-                let v = trim_ascii_ws(&line[colon + 1..]);
-                return Some(v);
+        }
+        if head_block[pos] == b'\r' && (pos + 1 == len || head_block[pos + 1] == b'\n') {
+            break;
+        }
+
+        let line_start = pos;
+        let mut colon = usize::MAX;
+        while pos < len {
+            let b = head_block[pos];
+            if b == b':' && colon == usize::MAX {
+                colon = pos;
+            }
+            if b == b'\n' {
+                break;
+            }
+            pos += 1;
+        }
+
+        let mut line_end = pos;
+        if line_end > line_start && head_block[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+
+        if colon != usize::MAX && colon > line_start && colon <= line_end {
+            let key = &head_block[line_start..colon];
+            if key.len() == name_len
+                && {
+                    let mut k0 = key[0];
+                    let mut n0 = name[0];
+                    if k0.is_ascii_uppercase() {
+                        k0 += 32;
+                    }
+                    if n0.is_ascii_uppercase() {
+                        n0 += 32;
+                    }
+                    k0 == n0
+                }
+                && key.eq_ignore_ascii_case(name)
+            {
+                let value_start = colon + 1;
+                if value_start <= line_end {
+                    return Some(trim_ascii_ws(&head_block[value_start..line_end]));
+                }
+                return Some(&[]);
             }
         }
-        pos = if end < head_block.len() { end + 1 } else { end };
+
+        if pos < len {
+            pos += 1;
+        }
     }
+
     None
 }
 
@@ -10652,6 +10890,46 @@ mod tests {
     }
 
     #[test]
+    fn slowloris_rebind_moves_incomplete_counter_from_peer_to_real_ip() {
+        let guard = make_slowloris_guard(10, 1, 1);
+
+        let mut tracked = Conn::new(100, 10, INVALID_BUF, 1_000);
+        tracked.client_ip = "10.0.0.1".to_string();
+        assert_eq!(
+            Worker::slowloris_start_tracking(&guard, &mut tracked, 1_000),
+            SlowlorisDecision::Allow
+        );
+        assert!(tracked.slowloris_tracking);
+
+        let mut blocked_on_peer = Conn::new(101, 11, INVALID_BUF, 1_000);
+        blocked_on_peer.client_ip = "10.0.0.1".to_string();
+        assert_eq!(
+            Worker::slowloris_start_tracking(&guard, &mut blocked_on_peer, 1_000),
+            SlowlorisDecision::DropTooManyIncomplete
+        );
+
+        assert_eq!(
+            Worker::slowloris_rebind_client_ip(Some(&guard), &mut tracked, "198.51.100.7"),
+            SlowlorisDecision::Allow
+        );
+        assert_eq!(tracked.client_ip, "198.51.100.7");
+
+        let mut now_peer_allows = Conn::new(102, 12, INVALID_BUF, 1_000);
+        now_peer_allows.client_ip = "10.0.0.1".to_string();
+        assert_eq!(
+            Worker::slowloris_start_tracking(&guard, &mut now_peer_allows, 1_000),
+            SlowlorisDecision::Allow
+        );
+
+        let mut real_ip_now_limited = Conn::new(103, 13, INVALID_BUF, 1_000);
+        real_ip_now_limited.client_ip = "198.51.100.7".to_string();
+        assert_eq!(
+            Worker::slowloris_start_tracking(&guard, &mut real_ip_now_limited, 1_000),
+            SlowlorisDecision::DropTooManyIncomplete
+        );
+    }
+
+    #[test]
     fn keepalive_reset_clears_request_state_and_keeps_connection_identity() {
         let mut c = Conn::new(33, 7, INVALID_BUF, 1_000);
         c.client_ip = "198.51.100.88".to_string();
@@ -10885,7 +11163,7 @@ mod tests {
         assert_ne!(untrusted_peer.value, "client-id");
     }
 
-    fn compile_test_cfg(routes_json: &str) -> SharedConfig {
+    fn compile_test_cfg_result(routes_json: &str) -> arc_common::Result<SharedConfig> {
         let raw = format!(
             r#"{{
   "listen": "127.0.0.1:18080",
@@ -10916,7 +11194,11 @@ mod tests {
   "routes": {routes_json}
 }}"#
         );
-        ConfigManager::compile_raw_json(raw.as_str()).expect("compile test config")
+        ConfigManager::compile_raw_json(raw.as_str())
+    }
+
+    fn compile_test_cfg(routes_json: &str) -> SharedConfig {
+        compile_test_cfg_result(routes_json).expect("compile test config")
     }
 
     #[test]
@@ -10954,7 +11236,7 @@ mod tests {
 
     #[test]
     fn route_dispatch_reports_ambiguous_when_priority_and_specificity_tie() {
-        let cfg = compile_test_cfg(
+        let err = compile_test_cfg_result(
             r#"[
   {
     "path": "/api",
@@ -10975,11 +11257,10 @@ mod tests {
     ]
   }
 ]"#,
-        );
+        )
+        .expect_err("ambiguous config should fail at compile time");
 
-        let req_head = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let res = select_route_http1_from_cfg(&cfg, b"GET", b"/api", req_head, None, false);
-        assert_eq!(res, Err(RouteSelectError::Ambiguous));
+        assert!(err.to_string().contains("ambiguous routes with same path/priority/specificity"));
     }
 
     #[test]

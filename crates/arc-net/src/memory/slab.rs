@@ -1,12 +1,3 @@
-//! Slab with generation keys.
-//!
-//! 设计：
-//! - idx + gen 防止 ABA：当连接释放后再复用 slot，旧 CQE 会因 gen 不匹配而被忽略。
-//! - entries 预分配，热路径无 malloc。
-//!
-//! Safety：
-//! - `write()` 必须只对 alloc() 刚分配的 key 调用一次。
-
 use std::io;
 use std::mem::MaybeUninit;
 use std::ptr;
@@ -125,10 +116,6 @@ impl<T> Slab<T> {
         out
     }
 
-    /// Cancel a slot that was allocated but never initialized via `write()`.
-    ///
-    /// This must only be used on early-failure paths before writing a value.
-    /// It will not run `drop` for `T`.
     pub fn cancel_alloc(&mut self, key: Key) {
         let i = key.idx as usize;
         if i >= self.entries.len() {

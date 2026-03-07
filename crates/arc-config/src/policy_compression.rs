@@ -1,42 +1,3 @@
-//! Response compression policy (global + per-route).
-//!
-//! Spec mapping:
-//!
-//! ```yaml
-//! compression:
-//!   enabled: true
-//!   min_size: 1024
-//!   algorithms: [zstd, br, gzip]
-//!   mime_types:
-//!     include: []
-//!     exclude: []
-//!   adaptive:
-//!     enabled: true
-//!     cpu_high_threshold: 0.80
-//!     cpu_low_threshold: 0.30
-//!     check_interval: 5s
-//!     cooldown: 30s
-//!
-//! routes:
-//!   - name: large-export
-//!     compression:
-//!       algorithm: zstd
-//!       level: 1
-//!       min_size: 512
-//!   - name: auth-api
-//!     compression:
-//!       enabled: false
-//!   - name: sse-stream
-//!     compression:
-//!       flush_per_event: true
-//! ```
-//!
-//! Design goals:
-//! - Smart defaults: enable only requires `enabled: true`
-//! - Strict validation: startup ERROR on invalid fields
-//! - Resolved policy: route override > global > built-in
-//! - Adaptive control: no new threads; data-plane reads CPU metrics and calls controller
-
 use arc_common::{ArcError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -101,11 +62,6 @@ pub enum CompressionAlgorithm {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompressionMimeTypesConfig {
-    /// Extra include patterns appended to built-in include list.
-    ///
-    /// Allowed forms:
-    /// - `text/*`
-    /// - `application/json`
     #[serde(default)]
     pub include: Vec<String>,
 
@@ -171,12 +127,6 @@ pub struct CompressionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Minimum Content-Length in bytes to enable compression.
-    ///
-    /// Default: 1024.
-    ///
-    /// Note:
-    /// - Only applied when upstream provides Content-Length.
     #[serde(default = "default_min_size")]
     pub min_size: usize,
 
@@ -244,12 +194,6 @@ pub struct RouteCompressionConfig {
     #[serde(default)]
     pub algorithm: Option<CompressionAlgorithm>,
 
-    /// Force a fixed compression level.
-    ///
-    /// Validation:
-    /// - zstd: 1..=5
-    /// - gzip: 1..=9
-    /// - br:   4..=6
     #[serde(default)]
     pub level: Option<i32>,
 

@@ -116,13 +116,6 @@ pub struct MemberRumor {
     pub ts_ms: u64,
 }
 
-/// Config rumor payload.
-///
-/// Conflict resolution uses `(version, origin_node_id)`:
-/// - bigger `version` wins
-/// - tie => lexicographically bigger origin node_id wins
-///
-/// `raw_json` is the canonical JSON string bytes.
 #[derive(Debug, Clone)]
 pub struct ConfigRumor {
     pub version: u64,

@@ -1,14 +1,3 @@
-//! HTTP/1.1 chunked transfer encoding helpers.
-//!
-//! When compressing an upstream chunked response, Arc must:
-//! - decode upstream chunked -> get raw payload bytes
-//! - feed payload into streaming compressor
-//! - encode compressed bytes as downstream chunked
-//!
-//! This module provides:
-//! - `ChunkedDecoder` (incremental)
-//! - `encode_chunked` / `encode_chunked_end`
-
 use arc_common::{ArcError, Result};
 
 /// Encode one chunk: `<hex>\r\n<data>\r\n`.
@@ -100,12 +89,6 @@ impl ChunkedDecoder {
         self.trailer_line_len = 0;
     }
 
-    /// Decode `input` and call `on_data` with each payload slice.
-    ///
-    /// Returns:
-    /// - `consumed`: how many input bytes were consumed for the current message body
-    /// - `done`: whether the chunked body is complete (0-chunk + trailers)
-    /// - `error`: whether parsing failed
     pub fn decode<F>(&mut self, input: &[u8], mut on_data: F) -> ChunkedDecodeResult
     where
         F: FnMut(&[u8]),

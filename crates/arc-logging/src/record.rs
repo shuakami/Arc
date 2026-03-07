@@ -18,10 +18,6 @@ pub enum LogLevel {
     Error,
 }
 
-/// Small-string optimized immutable string used in log records.
-///
-/// - Inline up to 32 bytes (no alloc)
-/// - Otherwise stores `Arc<str>` (one alloc per distinct long value)
 #[derive(Clone)]
 pub enum LogStr {
     Inline { len: u8, buf: [u8; 32] },
@@ -139,15 +135,6 @@ impl From<f64> for LogValue {
     }
 }
 
-/// Request-scoped context view for automatic injection into logs.
-///
-/// This is intentionally minimal and cloneable.
-/// It can be placed inside an existing `GatewayContext` and referenced by `enter_request_scope`.
-///
-/// trace_id/span_id source of truth:
-/// - If inbound request has W3C `traceparent`, parse and store values here.
-/// - If inbound request has no valid `traceparent`, generate new IDs and store here.
-/// - Forwarding should propagate a `traceparent` derived from this context.
 #[derive(Debug, Clone)]
 pub struct RequestContextView {
     pub trace_id: LogStr,
@@ -172,18 +159,6 @@ impl RequestContextView {
     }
 }
 
-/// Access log context held per in-flight request.
-///
-/// IMPORTANT (per spec):
-/// - This struct is designed to be embedded into per-request context and mutated during request processing.
-/// - Typical additional memory cost is ~200-500 bytes per in-flight request (depending on string lengths and inline/heap mode).
-///   At 100k concurrent connections this is ~50MB extra memory, which is a known/accepted tradeoff.
-///
-/// This context does not write anything by itself; at request end, convert into a record and submit.
-///
-/// Note:
-/// - trace_id/span_id should be copied from request context (existing observability context if available).
-/// - logging does not require a second independent trace-id generator in the data path.
 #[derive(Debug, Clone)]
 pub struct AccessLogContext {
     pub trace_id: LogStr,

@@ -1,15 +1,3 @@
-//! SSE (Server-Sent Events) event splitter.
-//!
-//! Spec mapping:
-//! - SSE 场景：每个 event 压缩后立即 flush，不攒批。
-//!
-//! SSE event delimiter:
-//! - "\n\n" or "\r\n\r\n"
-
-/// SSE event splitter that operates on a stream of bytes without buffering entire events.
-///
-/// It produces segments of the input; when a segment ends at an event boundary,
-/// it marks `flush=true`.
 pub struct SseEventSplitter {
     // Sliding window of the last 3 bytes in stream order.
     // prev[2] is the most recent byte.
@@ -32,10 +20,6 @@ impl SseEventSplitter {
         self.prev = [0u8; 3];
     }
 
-    /// Iterate over segments in `input`.
-    ///
-    /// `on_segment(seg, flush)` is called for each segment.
-    /// - `flush=true` means: the segment ends exactly at an SSE event boundary (`\n\n` or `\r\n\r\n`)
     pub fn for_each_segment<F>(&mut self, input: &[u8], mut on_segment: F)
     where
         F: FnMut(&[u8], bool),

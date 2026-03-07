@@ -1,18 +1,3 @@
-//! arc-rate-limit
-//!
-//! 这个 crate 是什么：
-//! - 无锁限流器实现，热路径仅原子 CAS，无 Mutex/RwLock。
-//!
-//! 算法选择：GCRA（Generic Cell Rate Algorithm）
-//! - 可视为 token-bucket 的等价实现方式：
-//!   - interval = 1/rate
-//!   - burst 通过 “允许的最大超前量” 控制
-//! - 优点：只需要一个 atomic(u64) 保存 TAT（theoretical arrival time），比维护 (tokens,last) 更易无锁实现。
-//!
-//! 精度取舍：
-//! - 使用纳秒时间戳，避免浮点。
-//! - 所有运算使用饱和/扩展到 u128 以避免溢出。
-
 use arc_common::{ArcError, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 

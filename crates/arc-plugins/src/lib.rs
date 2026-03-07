@@ -1,34 +1,3 @@
-//! arc-plugins
-//!
-//! 这个 crate 是什么：
-//! - WASM 插件引擎（Wasmtime）
-//! - 插件模块加载（Module）
-//! - worker 内实例池（避免冷启动开销）
-//! - 超时隔离：epoch interruption（默认 2ms）
-//! - panic 隔离：catch_unwind，不让单插件 crash worker
-//!
-//! 这个 crate 不是什么：
-//! - 不负责路由/限流/网络/协议。
-//!
-//! ABI（最小可用）
-//! - 插件必须导出：
-//!   - memory: `memory`
-//!   - alloc:  `alloc(len: i32) -> i32`
-//!   - dealloc:`dealloc(ptr: i32, len: i32)`
-//!   - on_request: `on_request(method_ptr: i32, method_len: i32, path_ptr: i32, path_len: i32) -> i32`
-//!
-//! 返回值约定：
-//! - 0 => allow
-//! - 100..=599 => deny with http status
-//! - 其他 => deny 500
-//!
-//! Host imports（可选）：
-//! - `arc_deny(status: i32)`：插件内部可主动拒绝（status override）
-//!
-//! 注意：
-//! - 为了保证数据面 zero-alloc，host 与 wasm 间的数据交换仅在必要时复制到 wasm memory。
-//! - 进一步的“按需读取 header/body” ABI 可在此基础上扩展（例如 get_header 等）。
-
 use arc_common::{ArcError, Result};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -174,11 +143,6 @@ impl WorkerPlugins {
         self.pools.len()
     }
 
-    /// Execute a plugin by id on request.
-    ///
-    /// 热路径注意：
-    /// - 仅 Vec::pop/push（不分配）
-    /// - wasm 执行可能内部有开销；建议插件保持极小逻辑并设置 timeout。
     #[inline]
     pub fn exec_on_request(&mut self, plugin_id: usize, req: RequestView<'_>) -> PluginVerdict {
         let pool = match self.pools.get_mut(plugin_id) {

@@ -36,6 +36,7 @@ target-*/
 *.bpf.o
 
 # Benchmark results (keep structure)
+benchmark/results/
 benchmark/results/*
 !benchmark/results/.gitkeep
 

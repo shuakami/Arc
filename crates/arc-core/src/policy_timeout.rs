@@ -1,35 +1,3 @@
-//! Request timeout tiering policy (connect / response_header / per_try / total).
-//!
-//! This module is designed to be shared by:
-//! - config compilation (per-route overrides + global defaults + built-in defaults)
-//! - data-plane runtime (deadline propagation parsing / formatting)
-//!
-//! # Spec mapping
-//!
-//! ```yaml
-//! timeout:
-//!   connect: 3s
-//!   response_header: 30s
-//!   per_try: 10s
-//!   total: 60s
-//!   deadline_propagation:
-//!     enabled: true
-//!     header: X-Request-Deadline
-//! ```
-//!
-//! Smart expansion (DX):
-//!
-//! ```yaml
-//! timeout: 30s
-//! # expanded into:
-//! # connect=3s, response_header=25s, per_try=25s, total=30s
-//! ```
-//!
-//! Validation (startup ERROR, not warning):
-//! - connect <= per_try <= total
-//! - response_header <= per_try
-//! - per_try * retry.attempts <= total
-
 use std::fmt;
 use std::time::Duration;
 
@@ -50,10 +18,6 @@ pub const BUILTIN_TIMEOUT_PER_TRY: Duration = Duration::from_secs(30);
 /// Built-in default absolute timeout cap for the whole request.
 pub const BUILTIN_TIMEOUT_TOTAL: Duration = Duration::from_secs(60);
 
-/// When `timeout` is provided as a scalar (e.g. `timeout: 30s`), Arc expands it into tiered timeouts.
-///
-/// We keep a small fixed slack so `response_header` / `per_try` do not consume `total` entirely.
-/// This matches the spec example (30s -> 25s).
 const SMART_TOTAL_SLACK: Duration = Duration::from_secs(5);
 
 /// Minimum duration floor used to avoid zero-duration corner cases.
@@ -75,13 +39,6 @@ pub struct DeadlinePropagationConfig {
     #[serde(default)]
     pub enabled: Option<bool>,
 
-    /// Inbound/outbound header name used for propagation.
-    ///
-    /// Default: `X-Request-Deadline`.
-    ///
-    /// Semantics:
-    /// - Inbound: if present, treated as a **time budget** (remaining time), not an absolute timestamp.
-    /// - Outbound: we write the effective remaining budget (min(client, route total)).
     #[serde(default)]
     pub header: Option<String>,
 }
@@ -237,14 +194,6 @@ fn clamp_nonzero(d: Duration) -> Duration {
     }
 }
 
-/// Smart default expansion for `timeout: <scalar>`.
-///
-/// Spec example:
-///
-/// ```yaml
-/// timeout: 30s
-/// # connect=3s, response_header=25s, per_try=25s, total=30s
-/// ```
 pub fn derive_from_total(total: Duration) -> EffectiveTimeoutTier {
     let total = clamp_nonzero(total);
 
@@ -404,13 +353,6 @@ fn div_duration_floor(d: Duration, n: u32) -> Duration {
     }
 }
 
-/// Parse an inbound deadline propagation header as a **remaining time budget**.
-///
-/// Accepted formats:
-/// - integer milliseconds: `"1500"`
-/// - humantime duration: `"1.5s"`, `"200ms"`, `"2m"`
-///
-/// Returns `None` if parsing fails or the value is empty.
 pub fn parse_deadline_budget(value: &str) -> Option<Duration> {
     let s = value.trim();
     if s.is_empty() {
@@ -438,10 +380,6 @@ pub fn format_deadline_budget_ms(d: Duration) -> String {
     ms.to_string()
 }
 
-/// Compute the effective request total timeout, taking client-provided deadline budget into account.
-///
-/// - If deadline propagation is disabled, the effective total is `route_total`.
-/// - If enabled and `client_budget` is present, effective total = min(route_total, client_budget).
 pub fn compute_effective_total(
     route_total: Duration,
     client_budget: Option<Duration>,

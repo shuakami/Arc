@@ -1,16 +1,3 @@
-//! gzip streaming compressor.
-//!
-//! Spec mapping:
-//! - gzip 兼容 fallback
-//! - 使用 Z_SYNC_FLUSH 语义实现流式压缩，不等待完整响应体
-//!
-//! Implementation:
-//! - We implement gzip container ourselves:
-//!   - header (10 bytes)
-//!   - raw deflate stream via flate2::Compress (zlib backend), flush=Sync
-//!   - trailer: crc32 + isize
-//! - This gives explicit control over sync flush and allows pooling/reuse.
-
 use arc_common::Result;
 use crc32fast::Hasher;
 use flate2::{Compress, Compression, FlushCompress, Status};

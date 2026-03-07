@@ -1,23 +1,3 @@
-//! Arc's path router.
-//!
-//! This router is used on the dataplane hot-path, so it is optimized to avoid heap allocations
-//! while matching.
-//!
-//! Supported path patterns:
-//! - Exact paths: `/api/v1/health`
-//! - Prefix wildcard (suffix `/*`): `/static/*`
-//!   - Matches `/static` and anything under `/static/...`
-//!   - Does NOT match `/staticx` (boundary is enforced)
-//! - Named params (single segment): `/user/:id/profile`
-//! - Prefix with named params: `/user/:id/*`
-//! - Simple segment globs: `/assets/*.css`, `/v?:/status`
-//!   - `*` and `?` match within a single path segment (they do not cross `/`).
-//! - Single-segment wildcard `*` inside the pattern: `/foo/*/bar`
-//!
-//! Notes:
-//! - Matching ignores the query (`?`) and fragment (`#`) parts of the incoming request target.
-//! - Duplicate/ambiguous patterns are rejected at insert time.
-
 use arc_common::{ArcError, Result};
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -67,19 +47,6 @@ impl Router {
         }
     }
 
-    /// Insert a new route pattern into this router.
-    ///
-    /// Pattern rules:
-    /// - Must start with `/`
-    /// - Must not contain `?` or `#` (query/fragment are ignored for matching)
-    /// - `/*` suffix means "prefix match with boundary"
-    /// - `:name` segments are named params (single segment)
-    /// - `*` segment is a single-segment wildcard
-    /// - `*` / `?` inside a segment form a simple glob (within that segment)
-    ///
-    /// Insert will reject:
-    /// - exact duplicates for literal patterns
-    /// - clearly ambiguous duplicates for param/wildcard patterns (same semantics)
     pub fn insert(&mut self, path_pat: &str, value: u32) -> Result<()> {
         if !path_pat.starts_with('/') {
             return Err(ArcError::config(format!(
@@ -164,11 +131,6 @@ impl Router {
         Ok(())
     }
 
-    /// Find the route id matching the given request target.
-    ///
-    /// Notes:
-    /// - Input may include query/fragment; matching ignores `?` and `#` and anything after them.
-    /// - Performs no heap allocations.
     pub fn at(&self, path: &[u8]) -> Option<u32> {
         let path = strip_query_and_fragment(path);
         if path.is_empty() || path[0] != b'/' {
@@ -197,10 +159,6 @@ impl Router {
         }
     }
 
-    /// Iterate all routes that can match this request target.
-    ///
-    /// This is used by dataplane policy selection where a request needs to evaluate
-    /// multiple route candidates (matchers/priority/specificity).
     pub fn for_each_candidate<F: FnMut(u32)>(&self, path: &[u8], mut f: F) {
         let path = strip_query_and_fragment(path);
         if path.is_empty() || path[0] != b'/' {
@@ -320,11 +278,6 @@ impl Router {
         }
     }
 
-    /// Return `(exact_literal, best_prefix_literal_with_spec)`.
-    ///
-    /// Prefix wildcard matches are boundary-checked:
-    /// - If the router has `/static/*`, it matches `/static` and `/static/...`
-    /// - It does NOT match `/staticx`
     fn match_literal(&self, path: &[u8]) -> (Option<u32>, Option<(u32, SpecKey)>) {
         let mut nidx = 0u32;
         let mut rest = path;
@@ -685,13 +638,6 @@ fn compile_segment(tok: &SegToken<'_>) -> Result<Seg> {
     })
 }
 
-/// Normalized signature used for rejecting obvious ambiguous duplicates.
-///
-/// Rules:
-/// - Param (`:id`) and Star (`*`) are normalized to the same token (both match any single segment).
-/// - Glob keeps its pattern bytes.
-/// - Literal keeps its bytes.
-/// - Prefix/Exact kind is included.
 fn build_signature(kind: PatternKind, segs: &[Seg]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(match kind {

@@ -7,11 +7,6 @@ use std::{
     time::Instant,
 };
 
-/// Lock-free on the hot path **by construction**:
-/// - We shard by worker thread using `thread_local!` maps.
-/// - No cross-thread synchronization on per-request checks.
-///
-/// For truly cross-thread keys, build a dedicated, sharded, concurrent map.
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     qps: u64,
@@ -19,10 +14,6 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Create a token bucket limiter.
-    ///
-    /// `qps`: steady refill per second.
-    /// `burst`: bucket capacity.
     pub fn new(qps: u64, burst: u64) -> Self {
         Self { qps, burst }
     }

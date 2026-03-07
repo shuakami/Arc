@@ -1,11 +1,3 @@
-//! WASM plugin engine (sandbox).
-//!
-//! Arc uses Wasmtime with:
-//! - precompiled modules
-//! - per-worker instance pools
-//! - fuel / epoch interruption for strict CPU budgets
-//! - a narrow host ABI to read/modify request/response context
-
 use crate::config::WasmPluginConfig;
 use ahash::AHashMap;
 use std::sync::Arc;

@@ -1,25 +1,8 @@
-//! arc-common
-//!
-//! 这个 crate 是什么：
-//! - 提供整个 workspace 统一的错误类型 `ArcError` 与 `Result<T>`。
-//!
-//! 这个 crate 不是什么：
-//! - 不包含任何网络、协议、路由、插件实现。
-//! - 不承担日志/metrics 责任（这些在 arc-observability）。
-//!
-//! 边界：
-//! - 其他 crate 只允许通过 `ArcError` 传播错误，不在库内部传播 `Box<dyn Error>`。
-
 use core::fmt;
 
 /// Workspace-wide result type.
 pub type Result<T> = core::result::Result<T, ArcError>;
 
-/// Workspace-wide error type.
-///
-/// 设计取舍：
-/// - 热路径不构造复杂 `String`（大部分运行时错误携带 `&'static str` + `io::Error`）。
-/// - 配置加载/编译属于非热路径，可携带 `String` 以提供足够上下文。
 #[derive(Debug)]
 pub enum ArcError {
     Io {

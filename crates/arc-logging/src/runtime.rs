@@ -279,6 +279,16 @@ pub fn global() -> Option<Arc<LoggingHandle>> {
     GLOBAL.get().cloned()
 }
 
+pub fn access_log_hot_path_enabled() -> bool {
+    let Some(h) = GLOBAL.get() else {
+        return false;
+    };
+    let rt = h.runtime.load();
+    rt.access.sample > 0.0
+        || !rt.access.force_on_status.is_empty()
+        || rt.access.force_on_slow_ms > 0
+}
+
 /// Initialize worker TLS ring pointer.
 ///
 /// Must be called once per worker thread (hot path depends on it).
@@ -300,21 +310,6 @@ pub fn init_worker(wid: usize) -> Result<()> {
     Ok(())
 }
 
-/// Enter request scope for automatic context injection.
-///
-/// This sets a TLS pointer for the current thread; it must be cleared on drop.
-/// The referenced `RequestContextView` must outlive the returned guard.
-///
-/// 重要：这个接口适合 thread-per-core 的同步 worker。
-/// 如果在 tokio 异步任务里跨 await 使用，请改用 task-local 或显式上下文传递，
-/// 否则任务迁移线程后会出现上下文字段缺失。
-///
-/// Typical use in worker request handling:
-/// ```ignore
-/// let view = RequestContextView { ... };
-/// let _g = enter_request_scope(&view);
-/// // any logs can now auto-attach context
-/// ```
 pub fn enter_request_scope<'a>(view: &'a RequestContextView) -> RequestScopeGuard<'a> {
     let prev = TL_REQ_VIEW.with(|c| {
         let p = c.get();

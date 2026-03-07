@@ -1,15 +1,3 @@
-//! Compressor object pools.
-//!
-//! Spec mapping:
-//! - 每种算法独立对象池
-//! - pool size = worker_threads * 2
-//! - 请求开始时从池取，请求结束时 reset 状态归还
-//! - 池满时创建新对象，不阻塞
-//!
-//! Implementation notes:
-//! - We reset on acquisition (`start(level)`), and also attempt to finish/reset on release best-effort.
-//! - Returning to pool never blocks; push failure drops the object.
-
 use arc_common::{ArcError, Result};
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;

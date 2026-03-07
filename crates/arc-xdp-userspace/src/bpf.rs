@@ -1,14 +1,3 @@
-//! Minimal BPF syscall wrappers.
-//!
-//! 目标：
-//! - 打开 pinned map/link（BPF_OBJ_GET）
-//! - map lookup/update/delete/get_next_key
-//! - 读 map info（BPF_OBJ_GET_INFO_BY_FD）
-//!
-//! 注意：
-//! - 这里不依赖 libbpf-rs，避免引入额外 C 依赖。
-//! - RingBuffer 的消费在 manager 内部用 mmap + poll 自实现（ringbuf map 可 mmap）。
-
 use std::ffi::CString;
 use std::io;
 use std::mem;
@@ -186,11 +175,6 @@ pub fn map_info_by_fd(fd: RawFd) -> io::Result<BpfMapInfo> {
     }
 }
 
-/// Marker trait: a type can be safely passed to kernel as raw bytes.
-///
-/// # Safety
-/// The type must be `#[repr(C)]` or otherwise have a stable layout identical to the kernel expectation,
-/// contain no pointers, and be plain-data.
 pub unsafe trait Pod: Copy + 'static {}
 
 unsafe impl Pod for u8 {}
@@ -331,10 +315,6 @@ pub fn map_delete_elem<K: Pod>(map_fd: RawFd, key: &K) -> io::Result<bool> {
     }
 }
 
-/// Get next key: if `key` is None => first key.
-///
-/// Ok(true) => next key written into `next_key`.
-/// Ok(false) => no next key (end).
 pub fn map_get_next_key<K: Pod>(
     map_fd: RawFd,
     key: Option<&K>,

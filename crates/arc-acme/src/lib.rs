@@ -61,21 +61,11 @@ pub struct AcmeRuntimeConfig {
     /// Contact email (without `mailto:` prefix; we will add it).
     pub email: String,
 
-    /// Domain list to manage (SNI exact matches, lowercase recommended).
-    ///
-    /// Note: `rustls-acme` (0.15.x) does **not** support DNS-01, so wildcards like `*.example.com`
-    /// are rejected by this module.
     pub domains: Vec<String>,
 
     /// Encrypt-at-rest cache directory. This directory contains encrypted account and cert blobs.
     pub cache_dir: PathBuf,
 
-    /// Master key material (string). Supports:
-    /// - `base64:<...>`
-    /// - `hex:<...>`
-    /// - otherwise UTF-8 bytes directly
-    ///
-    /// We derive two AEAD keys via HKDF-SHA256, and store account/cert blobs with AEAD.
     pub master_key: String,
 
     /// If `true`, use Let's Encrypt staging; else production.
@@ -677,10 +667,6 @@ impl AccountCache for EncryptedAccountCache {
     }
 }
 
-/// Main ACME service handle.
-/// - Maintains a domain->resolver routing table.
-/// - Provides HTTP-01 responder (optional).
-/// - Runs background ACME renewals (rustls-acme state machine) in a dedicated tokio runtime thread.
 pub struct AcmeService {
     cfg: AcmeRuntimeConfig,
     routing: ArcSwap<RoutingTable>,
@@ -688,10 +674,6 @@ pub struct AcmeService {
 }
 
 impl AcmeService {
-    /// Start ACME background runtime (threaded) and return a handle for:
-    /// - SNI routing (TLS handshake)
-    /// - HTTP-01 key_auth lookup
-    /// - status snapshot
     pub fn start_threaded(cfg: AcmeRuntimeConfig) -> Result<Arc<Self>, AcmeError> {
         let cfg = Self::validate_and_normalize(cfg)?;
 

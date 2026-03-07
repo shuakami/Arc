@@ -1,22 +1,5 @@
 #![no_std]
 
-//! arc-xdp-common
-//!
-//! 该 crate 为 **用户态** 与 **eBPF 内核态** 共享的 ABI 类型定义（no_std）。
-//!
-//! 设计原则：
-//! - 所有跨边界结构体均为 `#[repr(C)]` + Plain-Old-Data（POD）
-//! - 不包含任何堆分配、trait object、Vec/String 等 std 类型
-//! - 通过 feature gate 同时为用户态(`aya::Pod`)与 eBPF(`aya_ebpf::Pod`)提供 Pod 实现
-//!
-//! 注意：
-//! - `IpKey` 使用 **IPv6 128-bit 统一表示**。IPv4 使用 IPv6-mapped 格式：`::ffff:a.b.c.d`。
-//! - `prefix_len` 为 0..=128，按 128-bit 地址计算。
-//!   - IPv4 /32 的 `prefix_len` 应为 `96 + 32 = 128`（即精确匹配）。
-//!   - IPv4 /24 的 `prefix_len` 应为 `96 + 24 = 120`。
-//!
-//! Map pin 基路径固定为：`/sys/fs/bpf/arc/`（由用户态加载器 pin）。
-
 /// 所有 map pin 的基路径（用户态加载器使用）。
 pub const ARC_BPF_PIN_BASE: &str = "/sys/fs/bpf/arc";
 
@@ -141,14 +124,6 @@ pub enum MapKind {
     PortStats = 8,
 }
 
-/// 统一 IP Key：128-bit 地址 + prefix_len（CIDR）。
-///
-/// - IPv6：直接存储 16 字节地址，prefix_len 为 IPv6 prefix。
-/// - IPv4：存储为 IPv6-mapped：`::ffff:a.b.c.d`
-///   - IPv4 prefix_len_v4 -> prefix_len = 96 + prefix_len_v4
-///
-/// `prefix_len` 仅用于 **用户态写入 map** 与（可选的）CIDR匹配逻辑。
-/// **高性能默认路径**：XDP 通常只做 prefix_len=128 的精确匹配。
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct IpKey {
@@ -250,10 +225,6 @@ impl BlacklistEntry {
     }
 }
 
-/// per-IP SYN/ACK 状态（per-CPU hash map value）。
-///
-/// 注意：per-CPU map 的 key 表是共享的，但 value 为每 CPU 独立副本；
-/// 用户态聚合时应取所有 CPU 的最大值/合并策略（契约里要求 max）。
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct SynState {
@@ -286,11 +257,6 @@ impl SynState {
     }
 }
 
-/// 全局统计（per-CPU array value）。
-///
-/// 说明：
-/// - 该 map 为 PERCPU_ARRAY，因此每个 CPU 写自己的槽位，无锁无竞争；
-///   用户态聚合时应对所有 CPU 求和，环形数组则按 index 对齐后求和。
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct GlobalStats {
@@ -390,11 +356,6 @@ impl PortStats {
     }
 }
 
-/// 活跃连接跟踪 key（源/目的 IP+端口+协议）。
-///
-/// 说明：
-/// - 仅用于 RST 验证（攻击为伪造 RST 注入到本机 TCP 栈）。
-/// - IP 仍使用 16 字节统一表示（IPv4 为 IPv6-mapped）。
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct ConnKey {
@@ -451,12 +412,6 @@ impl ConnState {
     }
 }
 
-/// XDP 配置（用户态写入 CONFIG map，XDP 每包读取一次）。
-///
-/// 重要：
-/// - `magic` 必须由用户态写入为 `XDP_CONFIG_MAGIC`，否则 XDP 视为“未初始化配置”，
-///   并采用 **保守默认值**（基本不拦截，避免误杀）。
-/// - `flags` 用 bit 控制开关（见 `CFG_F_*` 常量）。
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct XdpConfig {
@@ -504,10 +459,6 @@ pub struct XdpConfig {
     /// UDP 限速：每端口最大 BPS（与 udp_tracked_ports 同 index，0 表示不限制）。
     pub udp_rate_limit_bps: [u32; MAX_TRACKED_PORTS],
 
-    /// SYN proxy cookie key（按你给的规格保留：由用户态生成并轮换）。
-    /// 说明：本实现为了与内核 TCP 栈在 LISTEN 状态下的 syncookie 校验路径互操作，
-    /// 使用内核 helper `bpf_tcp_gen_syncookie/bpf_tcp_check_syncookie` 生成/验证 cookie。
-    /// 因此该 secret 目前仅作为 ABI 字段保留（用户态仍可写入以满足契约/审计）。
     pub syn_cookie_secret: [u8; 32],
     /// cookie key id / epoch（用户态维护）。
     pub syn_cookie_key_id: u64,
@@ -548,24 +499,6 @@ impl XdpConfig {
     }
 }
 
-/// RingBuf 事件数据结构（固定大小，便于 eBPF 写入与用户态解析）。
-///
-/// 解释方式：由 `kind` 决定 `arg0/arg1` 的语义。
-///
-/// - `IpBlocked`：
-///   - arg0 = `BlockReason` (u32) 放在低 32 位
-///   - arg1 = ttl_ns
-/// - `AttackDetected`：
-///   - arg0.low32 = `AttackKind`
-///   - arg0.high32 = score
-///   - arg1 = threshold
-/// - `MapNearFull`：
-///   - arg0.low32 = `MapKind`
-///   - arg0.high32 = approx_usage_permille（0..1000，best-effort）
-///   - arg1 = reserved
-/// - `GlobalDefenseActivated`：
-///   - arg0.low32 = 1(开启)/0(关闭)
-///   - arg1 = reserved
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct XdpEvent {

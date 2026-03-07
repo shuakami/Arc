@@ -3,16 +3,6 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Lock-free SPSC ring buffer.
-///
-/// - Single producer (worker thread)
-/// - Single consumer (writer/aggregator thread)
-///
-/// Ring full => producer returns Err(item) immediately (drop on caller side).
-///
-/// This type uses `UnsafeCell` + atomics. All unsafe code has explicit invariants.
-///
-/// NOTE: This is intentionally minimal and allocation-free in push/pop (hot path).
 pub struct SpscRing<T> {
     buf: Box<[UnsafeCell<MaybeUninit<T>>]>,
     mask: usize,

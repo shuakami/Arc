@@ -22,13 +22,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use io_uring::{opcode, types, IoUring};
 
-/// Writer thread main loop.
-///
-/// - Drains per-worker rings (access logs).
-/// - Drains system/debug channels.
-/// - Applies redaction + JSON escaping at encode time.
-/// - NDJSON batch flush with io_uring write.
-/// - Rotation + optional gzip compression.
 pub fn run_writer(
     rings: Arc<[Arc<SpscRing<LogEvent>>]>,
     system_rx: Receiver<SystemLogRecord>,

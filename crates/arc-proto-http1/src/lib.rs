@@ -1,19 +1,3 @@
-//! arc-proto-http1
-//!
-//! 这个 crate 是什么：
-//! - HTTP/1.1 message head 解析（request/response start-line + headers）
-//! - message framing（Content-Length / Transfer-Encoding: chunked / close-delimited）
-//! - chunked body 增量解析器（不分配堆内存）
-//!
-//! 这个 crate 不是什么：
-//! - 不包含任何 socket / io_uring 细节（那在 arc-net）
-//! - 不包含路由/插件/限流（那是上层语义）
-//!
-//! 设计目标：
-//! - 热路径零堆分配
-//! - 在固定 buffer 内完成 head 解析
-//! - chunked 解析器能返回“本 buffer 内消息结束位置”，支持 pipelining tail stash
-
 use arc_common::{ArcError, Result};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -456,10 +440,6 @@ impl ChunkedState {
         matches!(self.stage, ChunkStage::Done)
     }
 
-    /// Consume bytes and return how many belong to current chunked message.
-    ///
-    /// If `done==true` and `consumed < buf.len()`, bytes after `consumed` belong to next message
-    /// (HTTP pipelining tail).
     pub fn consume(&mut self, buf: &[u8]) -> ConsumeResult {
         if matches!(self.stage, ChunkStage::Done) {
             return ConsumeResult::done(0);

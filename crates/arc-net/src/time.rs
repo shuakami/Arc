@@ -1,9 +1,3 @@
-//! Monotonic time utilities (Linux).
-//!
-//! 设计：
-//! - 使用 `clock_gettime(CLOCK_MONOTONIC)`（通常走 vDSO）
-//! - 返回纳秒 u64，方便无锁限流/超时判断。
-
 use core::mem;
 
 #[inline]

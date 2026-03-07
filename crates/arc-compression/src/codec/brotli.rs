@@ -1,20 +1,3 @@
-//! brotli streaming compressor.
-//!
-//! Spec mapping:
-//! - brotli level 4-6 only (实时压缩区间)
-//! - 仅在客户端明确支持时使用
-//! - SSE 场景需要逐 event flush
-//!
-//! Implementation notes:
-//! - We use brotli::CompressorWriter with a custom lock-free shared buffer sink.
-//! - This avoids requiring `into_inner/get_mut` methods (API differences across brotli versions),
-//!   and allows us to drain produced bytes after each write/flush.
-//!
-//! Safety:
-//! - The shared buffer uses `UnsafeCell<Vec<u8>>` and is accessed without locks.
-//! - Invariant: a `BrotliCompressor` instance is only used by one thread at a time (Arc worker model),
-//!   and we never drain concurrently with a write call.
-
 use arc_common::{ArcError, Result};
 use brotli::CompressorWriter;
 use std::cell::UnsafeCell;

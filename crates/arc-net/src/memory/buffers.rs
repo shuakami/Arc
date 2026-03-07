@@ -1,12 +1,3 @@
-//! Registered fixed buffers pool.
-//!
-//! 设计：
-//! - 预分配一段连续内存，按 buf_size 切分为 buf_count 个 fixed buffers。
-//! - free list + state bitmap 检测 double-free/越界（错误路径打印）。
-//!
-//! 热路径：
-//! - alloc/free 只有 Vec pop/push，无 malloc。
-
 use std::io;
 
 pub const INVALID_BUF: u16 = u16::MAX;

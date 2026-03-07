@@ -45,12 +45,6 @@ pub struct NodeConfig {
     #[serde(default)]
     pub workers: usize,
 
-    /// Hard limit on **accepted** downstream TCP connections.
-    ///
-    /// NOTE: For TLS endpoints, Arc enforces an exact limit via TLS-connection guards.
-    /// For plain TCP endpoints, Arc enforces an exact limit on the L4 proxy listener.
-    ///
-    /// Set to 0 to disable.
     #[serde(default)]
     pub max_connections: u64,
 
@@ -601,10 +595,6 @@ pub struct RouteMatch {
     #[serde(default)]
     pub query: Vec<QueryMatch>,
 
-    /// Boolean expression that combines matchers (AND/OR/NOT).
-    ///
-    /// If set, this expression is evaluated using named matcher references.
-    /// This is Arc's *high-dimensional* matcher.
     #[serde(default)]
     pub expr: Option<String>,
 }

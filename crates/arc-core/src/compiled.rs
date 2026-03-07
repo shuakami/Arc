@@ -3,13 +3,6 @@ use arc_swap::ArcSwap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// The fully compiled in-memory configuration that is used on the hot path.
-///
-/// This is intentionally **not** the same as the input YAML/JSON:
-/// - all regex are compiled
-/// - route trees (radix) are built
-/// - upstream registries are created
-/// - plugins are loaded / precompiled (where applicable)
 #[derive(Debug)]
 pub struct CompiledConfig {
     /// Unique generation id.

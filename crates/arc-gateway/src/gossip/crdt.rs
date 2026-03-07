@@ -1,10 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// G-Counter CRDT (Grow-only Counter).
-///
-/// - Monotonic increment per node.
-/// - Merge rule: per-node component-wise `max`.
 #[derive(Debug, Clone, Default)]
 pub struct GCounter {
     per_node: HashMap<Arc<str>, u64>,
@@ -67,14 +63,6 @@ impl GCounter {
     }
 }
 
-/// LWW-Register (Last-Write-Wins) CRDT.
-///
-/// - Clock is `ts` (u64).
-/// - Tie-break: lexicographically larger `node_id` wins when `ts` is equal.
-/// - Merge returns whether local state changed.
-///
-/// Note: `ts` is intentionally generic: it can be epoch millis, lamport clock,
-/// or a monotonic sequence; the comparator is the same.
 #[derive(Debug, Clone)]
 pub struct LwwRegister<T> {
     pub ts: u64,

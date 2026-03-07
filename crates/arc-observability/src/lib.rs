@@ -1,16 +1,3 @@
-//! arc-observability
-//!
-//! 这个 crate 是什么：
-//! - worker metrics structs（atomic counters）
-//! - admin server: 暴露 Prometheus `/metrics` 与 `/healthz`
-//!
-//! 不是什么：
-//! - 不包含数据面逻辑。
-//!
-//! 并发模型：
-//! - 每个 worker 只写自己的一份 metrics（AtomicU64 fetch_add / store）。
-//! - admin 线程只读所有 workers 的 metrics（Relaxed load 即可）。
-
 use arc_common::{ArcError, Result};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

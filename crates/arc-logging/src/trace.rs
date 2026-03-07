@@ -1,14 +1,3 @@
-//! W3C trace context helpers for access logging.
-//!
-//! Source policy:
-//! - If request carries `traceparent`, parse and reuse trace_id/span_id.
-//! - If missing or invalid, generate a new 128-bit trace_id and 64-bit span_id.
-//!
-//! Propagation policy:
-//! - Keep the same trace_id for the whole request path.
-//! - Use `child_for_upstream()` to generate a new span_id for upstream forwarding.
-//! - Emit `to_traceparent()` to inject downstream/upstream headers.
-
 use getrandom::getrandom;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,22 +10,12 @@ pub struct TraceContext {
 }
 
 impl TraceContext {
-    /// Resolve from optional `traceparent` header.
-    ///
-    /// - valid header => parsed context
-    /// - missing/invalid => generated context
     pub fn resolve_from_traceparent(traceparent: Option<&str>) -> Self {
         traceparent
             .and_then(Self::parse_traceparent)
             .unwrap_or_else(Self::generate)
     }
 
-    /// Parse W3C `traceparent`: `00-<trace-id>-<span-id>-<flags>`.
-    ///
-    /// This parser is strict:
-    /// - exact length 55
-    /// - only lowercase/uppercase hex
-    /// - trace_id/span_id must not be all-zero
     pub fn parse_traceparent(v: &str) -> Option<Self> {
         let b = v.as_bytes();
         if b.len() != 55 || b[2] != b'-' || b[35] != b'-' || b[52] != b'-' {

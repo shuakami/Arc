@@ -1,15 +1,3 @@
-//! Linux socket helpers.
-//!
-//! 这个模块是什么：
-//! - 创建 listener / client socket
-//! - 设置常用 socket 选项
-//!
-//! 不是什么：
-//! - 不包含任何协议/代理语义。
-//!
-//! 边界：
-//! - 上层只用 RawFd 与 SockAddr 指针，不跨层传递 std::net::TcpStream。
-
 use std::io;
 use std::mem;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -161,13 +149,6 @@ pub fn set_keepalive(fd: RawFd) -> io::Result<()> {
     set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)
 }
 
-/// Enable/disable SO_ZEROCOPY (best-effort).
-///
-/// - enabled=true => setsockopt(SO_ZEROCOPY)=1
-/// - enabled=false => setsockopt(SO_ZEROCOPY)=0
-///
-/// 注意：
-/// - 并非所有内核/驱动支持；失败应为 warn，不应中断功能。
 pub fn set_zerocopy(fd: RawFd, enabled: bool) -> io::Result<()> {
     set_sockopt_int(
         fd,

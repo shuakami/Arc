@@ -1,29 +1,3 @@
-//! Fire-and-forget traffic mirroring runtime (data plane).
-//!
-//! # Core guarantees (spec, MUST NOT break)
-//! - Mirror is fully fire-and-forget: main request must not wait.
-//! - Mirror errors/timeouts/panics never propagate to the main path.
-//! - Mirror tasks are isolated: independent timeout, independent connection usage.
-//! - Bounded queue by bytes: over limit -> drop immediately, WARN (rate-limited).
-//!
-//! # Implementation notes
-//! - Producer path uses:
-//!   - lock-free sampling (AtomicU64 + splitmix64) per target
-//!   - atomic queue-bytes reservation
-//!   - `Mutex::try_lock()` to avoid blocking the main path
-//! - Consumer runs in dedicated threads and may use blocking IO safely.
-//!
-//! This module is self-contained and does not require tokio.
-//!
-//! The HTTP parser here is intentionally minimal but correct enough for mirroring + comparison:
-//! - request: rewrites path + header set/remove, preserves body bytes
-//! - response: parses status + headers, supports content-length, chunked, and until-eof
-//! - compare: ignore headers + ignore JSON fields (subset of JSONPath: `$.a.b`)
-//!
-//! IMPORTANT: This runtime always injects/overrides `Connection: close` on mirror requests to
-//! simplify response completion semantics (avoid hanging on until-eof with keep-alive).
-//! This is safe for mirror (shadow) traffic and helps ensure timeout guarantees.
-
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -44,11 +18,6 @@ pub enum MirrorDropReason {
     Timeout,
 }
 
-/// Per-target mirror metrics (atomics).
-///
-/// NOTE: This module does not bind to a specific metrics backend.
-/// It exposes counters/gauges that can be scraped by the caller and
-/// exported to Prometheus with labels.
 #[derive(Debug)]
 pub struct MirrorTargetMetrics {
     sent_total: AtomicU64,
@@ -253,10 +222,6 @@ impl Default for MirrorPolicyRuntime {
     }
 }
 
-/// Context attached to a mirror submission (per main request).
-///
-/// Keep this small: it lives on the main path and will be cloned into tasks.
-/// Use `Arc<str>` / `Arc<[u8]>` to keep cloning cheap.
 #[derive(Clone, Debug)]
 pub struct MirrorSubmitContext {
     /// Domain/SNI/Host context for structured diff logs (best effort).
@@ -350,14 +315,6 @@ impl MirrorDispatcher {
         Self { state, workers }
     }
 
-    /// Submit mirror tasks for a set of targets.
-    ///
-    /// Safety guarantee:
-    /// - never blocks
-    /// - never panics (best effort)
-    /// - never returns an error
-    ///
-    /// The caller should call this after main request completion, but must not await it.
     pub fn submit_all(
         &self,
         targets: &[Arc<MirrorTargetRuntime>],
@@ -1337,13 +1294,6 @@ fn compare_body_json(
     true
 }
 
-/// Parse JSONPath strings (subset) into segments.
-///
-/// Supported subset:
-/// - `$.a`
-/// - `$.a.b`
-///
-/// Anything else yields empty segments and will be ignored by runtime.
 pub fn compile_ignore_body_fields(paths: &[String]) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     for p in paths {

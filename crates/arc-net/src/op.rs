@@ -1,15 +1,3 @@
-//! io_uring user_data packing.
-//!
-//! 边界：
-//! - 只负责把 (op kind + side + conn idx/gen) 打包进 u64，供 CQE 解码。
-//! - 不包含任何业务逻辑。
-//!
-//! user_data packing (64-bit):
-//! - bits 0..23   : connection index (24 bits)
-//! - bits 24..47  : generation (24 bits)
-//! - bits 48..55  : op kind (8 bits)
-//! - bits 56..63  : side (8 bits)
-
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OpKind {

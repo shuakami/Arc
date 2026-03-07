@@ -1,10 +1,3 @@
-/// JSON string escaping for NDJSON output.
-///
-/// Requirements:
-/// - All control characters must be escaped (prevents log injection).
-/// - Must produce valid JSON string encoding.
-///
-/// This module writes JSON strings directly into a byte buffer.
 pub fn write_json_string(out: &mut Vec<u8>, s: &str) {
     out.push(b'"');
 

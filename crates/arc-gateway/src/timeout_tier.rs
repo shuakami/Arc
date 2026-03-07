@@ -1,22 +1,4 @@
-//! Runtime helper for request timeout tiering on the io_uring state machine.
-//!
-//! Arc's worker uses a single `deadline_ns` per connection/task and a `TimeoutWheel`
-//! to expire deadlines asynchronously.
-//!
-//! This helper computes **the correct next deadline** (in monotonic nanoseconds) with:
-//! - total timeout (absolute safety valve)
-//! - per_try timeout (per attempt cap)
-//! - connect timeout (connect stage cap)
-//! - response_header timeout (TTFB cap before first byte)
-//!
-//! It is designed so the caller can do:
 //
-//! ```ignore
-//! conn.deadline_ns = timeouts.deadline_for_connect(now_ns);
-//! timeout_wheel.push(conn.deadline_ns, key);
-//! ```
-//!
-//! No extra timers, no blocking, no per-op allocations.
 
 use std::time::Duration;
 
@@ -124,10 +106,6 @@ impl RequestTimeoutState {
         stage.min(self.try_deadline_ns).min(self.total_deadline_ns)
     }
 
-    /// Compute deadline for upstream response header (TTFB) stage.
-    ///
-    /// If `resp_started` is false: deadline = min(now + response_header, try_deadline, total_deadline).
-    /// If `resp_started` is true: TTFB already satisfied; deadline = min(try_deadline, total_deadline).
     #[inline]
     pub fn deadline_for_response_header(
         &self,

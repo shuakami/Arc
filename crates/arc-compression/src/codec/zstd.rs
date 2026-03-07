@@ -1,12 +1,3 @@
-//! zstd streaming compressor using zstd-safe CCtx + compress_stream2.
-//!
-//! Spec mapping:
-//! - zstd 优先；流式压缩，不等待完整响应体
-//! - 每 chunk / 每 SSE event 需要立即 flush => ZSTD_e_flush
-//!
-//! Note: spec mentions zstd-seekable; Arc 数据面需求是“边生成边压缩边发送”，
-//! 这里用标准 zstd streaming API 实现。
-
 use arc_common::Result;
 
 use crate::{zstd_err, FlushMode};
@@ -35,11 +26,6 @@ impl ZstdCompressor {
         Ok(())
     }
 
-    /// Compress one chunk.
-    ///
-    /// The caller controls flush mode:
-    /// - FlushMode::Flush => uses `ZSTD_e_flush`
-    /// - FlushMode::Finish => uses `ZSTD_e_end` and drains all pending output
     pub fn compress(&mut self, input: &[u8], flush: FlushMode, out: &mut Vec<u8>) -> Result<()> {
         let directive = match flush {
             FlushMode::None => ZSTD_EndDirective::ZSTD_e_continue,

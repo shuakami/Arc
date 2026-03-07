@@ -296,11 +296,6 @@ pub struct RotationConfig {
     ///
     /// Default: 500MB.
     pub max_size_bytes: u64,
-    /// Minimum allowed rotate threshold.
-    ///
-    /// When `max_size_bytes` is lower than this, Arc logs a warning and clamps `max_size_bytes`.
-    ///
-    /// Default: 1MB.
     pub min_size_bytes: u64,
     /// Keep this many rotated history files (".1" .. ".N").
     ///

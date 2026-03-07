@@ -1,9 +1,3 @@
-//! Minimal io_uring uapi subset.
-//!
-//! 注意：这里是 uapi 结构与常量的“最小闭包”，只保留本仓库用到的部分，避免 dead_code warning。
-//!
-//! FFI 风格命名需要 non_camel_case_types，属于必要的 lint 关闭，不是用来隐藏 unused。
-
 #![allow(non_camel_case_types)]
 
 pub const IORING_OFF_SQ_RING: libc::off_t = 0;

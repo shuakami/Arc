@@ -1,12 +1,3 @@
-//! SQE builders.
-//!
-//! 边界：
-//! - 只负责填充 io_uring_sqe 结构。
-//! - 不包含业务逻辑。
-//!
-//! Safety：
-//! - addr 指针/ timespec 指针必须在 op 完成前保持有效（由调用方保证）。
-
 use std::mem;
 use std::os::fd::RawFd;
 

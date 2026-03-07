@@ -1,29 +1,6 @@
 #![no_std]
 #![no_main]
 
-//! arc-xdp (kernel-side eBPF/XDP programs)
-//!
-//! 目标：在流量进入内核 TCP 栈之前完成 L4 清洗与防护，保证极低延迟。
-//!
-//! 本 crate 只包含 **内核侧** eBPF/XDP 程序及 map 定义。
-//! 用户态加载器/降级逻辑/热更新（BPF_F_REPLACE）由另一个工程师实现。
-//!
-//! 关键约束：
-//! - 所有 map 将由用户态 pin 到 `/sys/fs/bpf/arc/` 下（通过 map_pin_path 或逐个 pin）。
-//! - 本程序实现你给定的处理优先级与算法：
-//!   1) 解析 L2 -> 非 IP PASS
-//!   2) 解析 IPv4/IPv6 -> 提取源 IP (IpKey)
-//!   3) 白名单 PASS
-//!   4) 黑名单 DROP
-//!   5) 解析 TCP/UDP
-//!   6) TCP: SYN flood / RST validate / ACK flood / (可选) SYN proxy(syncookie)
-//!   7) UDP: 目标端口统计 + (可选) 端口限速
-//!   8) 通过检查 PASS + 更新统计
-//!
-//! verifier 相关说明：
-//! - 所有循环均为 **常量上界**（<= 60、<= 32、<= 16），Linux 5.7+ verifier 可证明有界。
-//! - 所有指针运算均在 `data..data_end` 范围内显式边界检查。
-
 use core::mem;
 
 use aya_ebpf::{
@@ -236,10 +213,6 @@ static mut WHITELIST: HashMap<IpKey, u8> = HashMap::with_max_entries(65_536, 0);
 #[map(name = "arc_blacklist")]
 static mut BLACKLIST: LruHashMap<IpKey, BlacklistEntry> = LruHashMap::with_max_entries(1_000_000, 0);
 
-/// Map 3：per-IP SYN 状态（PERCPU_HASH）
-/// - 类型：BPF_MAP_TYPE_PERCPU_HASH
-/// - 并发：value 为每 CPU 独立副本；对同一 key 的 value 更新无跨 CPU 竞争；
-///   注意 key 插入/删除仍需 map 内部锁（仅在新 key 首次出现时）。
 #[map(name = "arc_syn_state")]
 static mut SYN_STATE: PerCpuHashMap<IpKey, SynState> = PerCpuHashMap::with_max_entries(500_000, 0);
 
@@ -255,11 +228,6 @@ static mut GLOBAL_STATS: PerCpuArray<GlobalStats> = PerCpuArray::with_max_entrie
 #[map(name = "arc_config")]
 static mut CONFIG: aya_ebpf::maps::Array<XdpConfig> = aya_ebpf::maps::Array::with_max_entries(1, 0);
 
-/// Map 6：实时事件（RINGBUF）
-/// - 类型：BPF_MAP_TYPE_RINGBUF
-/// - 并发：ringbuf helper 内部并发安全；写失败静默丢弃，不影响包处理。
-///
-/// 注意：BPF ringbuf map 类型在主线内核中通常需要 >= 5.8；如需严格 5.7，用户态加载器需做兼容降级。
 #[map(name = "arc_events")]
 static mut EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
@@ -269,10 +237,6 @@ static mut EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 #[map(name = "arc_conntrack")]
 static mut CONNTRACK: LruHashMap<ConnKey, ConnState> = LruHashMap::with_max_entries(2_000_000, 0);
 
-/// Map 8：目标端口统计（PERCPU_ARRAY）
-/// - 类型：BPF_MAP_TYPE_PERCPU_ARRAY
-/// - Key：array index（内核要求 u32），逻辑含义为目的端口 u16（0..65535）。
-/// - 并发：每 CPU 写自己的槽位，无锁。
 #[map(name = "arc_port_stats")]
 static mut PORT_STATS: PerCpuArray<PortStats> = PerCpuArray::with_max_entries(65_536, 0);
 

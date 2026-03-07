@@ -13,22 +13,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 
-/// SOTA Global Rate Limiter
-///
-/// - Data plane (io_uring workers) NEVER blocks on Redis.
-/// - Per-worker sharded L1 token bucket is the hot path.
-/// - L2 (Redis/Lua) is an async lease/refill backend behind a circuit breaker.
-/// - On backend timeout/error, instantly fallback to L1-only (zero downtime).
-///
-/// NOTE: integration is intended as:
-/// - create `GlobalRateLimiter::spawn(...)` during process init
-/// - create one `WorkerLimiter` per worker thread and keep it thread-local
-/// - call `try_acquire(...)` with a stable u64 key (already-hashed)
-///
-/// Keys:
-/// - Use a 64-bit stable hash for (route_id + client identity + any dimension).
-/// - Avoid string allocations in the worker hot path.
-
 pub const DEFAULT_REDIS_BUDGET_MS: u64 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,12 +154,6 @@ pub struct ReserveRequest {
     pub ttl_ms: u64,
 }
 
-/// Pluggable backend.
-///
-/// This backend is NOT called from io_uring workers. It is called only by the dedicated
-/// backend runtime thread (async), so implementations may use network I/O.
-///
-/// MUST be non-blocking in async sense; all CPU-heavy work should be minimal.
 pub trait RateLimiterBackend: Send + Sync + 'static {
     fn name(&self) -> &'static str;
 
@@ -531,12 +509,6 @@ async fn backend_loop(
 }
 
 impl WorkerLimiter {
-    /// Non-blocking hot path:
-    /// - drains a small number of refill responses
-    /// - enforces global lease tokens when backend is healthy
-    /// - always enforces local L1 token bucket
-    ///
-    /// Returns true => allowed, false => rate limited.
     #[inline]
     pub fn try_acquire(&mut self, key: u64, policy: Policy, now_ns: u64) -> bool {
         self.drain_responses(8);
@@ -734,12 +706,6 @@ fn monotonic_ns() -> u64 {
     base.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-/// Redis/Lua backend (pluggable).
-///
-/// Requires `redis` crate in Cargo and async runtime. This is intentionally isolated from io_uring workers.
-/// The script implements a token bucket in Redis hashes.
-///
-/// You can put this in `crates/arc-global-rate-limit/src/redis.rs` in a real tree; kept inline here.
 #[cfg(feature = "redis")]
 pub mod redis_backend {
     use super::*;
@@ -871,10 +837,6 @@ return grant
     }
 }
 
-/// Ultra-fast in-memory backend (single-process global). Still pluggable, still async.
-/// This is mainly useful for tests / single-node deployments without Redis.
-///
-/// This backend is designed for backend runtime thread usage, not for io_uring direct calls.
 pub struct InMemoryBackend {
     shards:
         Vec<std::sync::Mutex<HashMap<u64, GlobalBucket, BuildHasherDefault<IdentityU64Hasher>>>>,

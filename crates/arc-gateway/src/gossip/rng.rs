@@ -1,7 +1,3 @@
-/// A tiny PRNG for gossip peer sampling.
-///
-/// We avoid adding a `rand` dependency to keep the module self-contained.
-/// This is **not** cryptographically secure (not needed for internal gossip sampling).
 #[derive(Debug, Clone)]
 pub struct XorShift64 {
     state: u64,

@@ -23,10 +23,6 @@ const LOG_WRITE_DURATION_BUCKETS_NS: [u64; 12] = [
     2_500_000_000,
 ];
 
-/// Logging metrics required by Arc spec.
-///
-/// This is independent of any existing Arc observability implementation;
-/// integrate by calling `render_prometheus()` and appending to `/metrics` output.
 #[derive(Debug)]
 pub struct LogMetrics {
     written_access: AtomicU64,

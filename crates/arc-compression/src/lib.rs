@@ -1,16 +1,3 @@
-//! arc-compression
-//!
-//! Arc 的响应压缩模块（纯Rust数据面友好）：
-//! - 快速压缩决策（Accept-Encoding + MIME + Content-Length + 已压缩检测）
-//! - 流式压缩（zstd/gzip/brotli）
-//! - HTTP/1.1 chunked 解码/编码工具（压缩必须在 payload 上进行）
-//! - SSE 场景逐 event flush 分段器
-//! - 压缩器对象池（每算法独立，pop失败就新建，不阻塞）
-//! - 自适应压缩级别控制器（不创建线程；由外部注入 CPU 使用率样本）
-//!
-//! 注意：HTTP/1.1 / HTTP/2 的 framing 与响应头改写由 arc-gateway 数据面完成。
-//! 本 crate 只提供压缩/决策/解码基础设施。
-
 #![allow(missing_docs)]
 
 use arc_common::ArcError;

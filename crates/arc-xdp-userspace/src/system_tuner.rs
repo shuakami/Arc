@@ -1,13 +1,3 @@
-//! SystemTuner: `arc system tune --auto|--check`
-//!
-//! 目标：
-//! - 提供系统参数调优的一键/检查模式。
-//! - 每项操作输出清晰日志（成功/失败/跳过）。
-//!
-//! 注意：
-//! - 需要 root 权限的操作：写 /proc/sys、修改 ethtool 队列、写 /proc/irq/*/smp_affinity_list。
-//! - 本模块不依赖 tokio，避免额外 runtime 复杂度。
-
 use crate::bpf;
 use arc_common::{ArcError, Result};
 use std::ffi::CString;

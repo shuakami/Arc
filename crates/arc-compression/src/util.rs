@@ -61,11 +61,6 @@ pub fn content_type_token(v: &[u8]) -> &[u8] {
     trim_ascii_http_ws(&v[..end])
 }
 
-/// Extract `Content-Encoding` token (bytes before `,` or `;`), trimmed.
-///
-/// Notes:
-/// - We only need the first encoding token; if upstream returns multiple codings,
-///   Arc will conservatively treat it as "already encoded" and skip re-compress.
 #[inline]
 pub fn content_encoding_token(v: &[u8]) -> &[u8] {
     let v = trim_ascii_http_ws(v);

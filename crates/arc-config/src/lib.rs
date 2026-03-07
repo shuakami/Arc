@@ -1,20 +1,3 @@
-//! arc-config
-//!
-//! 这个 crate 是什么：
-//! - 配置 schema（支持 JSON/TOML/YAML 文件）
-//! - 编译配置：
-//!   - router (Radix Tree)
-//!   - plugins (WASM Modules metadata)
-//!   - rate limiters (atomic CAS limiter)
-//! - 热重载：后台线程 watch 文件 mtime，compile 成功后 `ArcSwap::store` 原子替换
-//!
-//! 这个 crate 不是什么：
-//! - 不包含数据面状态机（那在 arc-gateway）。
-//!
-//! 热重载内存序说明：
-//! - `ArcSwap::store` 内部使用 release store；worker `load` 使用 acquire load。
-//! - 这保证了新配置内容对 worker 可见（happens-before）。
-
 use arc_common::{ArcError, Result};
 use arc_plugins::PluginCatalog;
 use arc_rate_limit::Limiter;
@@ -320,6 +303,7 @@ impl Default for ControlPlaneConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct IoUringConfig {
+    #[serde(default = "default_io_uring_entries")]
     pub entries: u32,
     pub accept_multishot: bool,
     #[serde(default = "default_accept_prepost")]
@@ -358,6 +342,7 @@ pub struct UpstreamConfig {
     pub host: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
+    #[serde(default = "default_upstream_keepalive")]
     pub keepalive: usize,
     pub idle_ttl_ms: u64,
     #[serde(default = "default_dns_refresh_ms")]
@@ -873,10 +858,6 @@ pub struct SharedConfig {
     pub downstream_tls: Option<Arc<CompiledDownstreamTls>>,
 }
 
-/// Return config parameter paths that require process restart to take effect.
-///
-/// These fields are bound to startup-time resources (listener/admin sockets, worker/ring/buffer sizing),
-/// or fixed control-plane runtime state, or immutable cluster-circuit semantics.
 pub fn restart_required_changes(old: &SharedConfig, new: &SharedConfig) -> Vec<&'static str> {
     let mut changed = Vec::new();
     macro_rules! push_if_changed {
@@ -3287,8 +3268,18 @@ fn default_accept_prepost() -> u32 {
 }
 
 #[inline]
+fn default_io_uring_entries() -> u32 {
+    1024
+}
+
+#[inline]
 fn default_listen_backlog() -> i32 {
     4096
+}
+
+#[inline]
+fn default_upstream_keepalive() -> usize {
+    32
 }
 
 #[inline]
@@ -4197,6 +4188,45 @@ routes:
     upstream: "u"
 "#
         .to_string()
+    }
+
+    #[test]
+    fn io_uring_entries_and_upstream_keepalive_use_defaults_when_omitted() {
+        let raw = r#"{
+  "listen": "127.0.0.1:18080",
+  "admin_listen": "127.0.0.1:19900",
+  "workers": 1,
+  "require_upstream_mtls": false,
+  "io_uring": {
+    "accept_multishot": false,
+    "tick_ms": 10,
+    "sqpoll": false,
+    "sqpoll_idle_ms": 0,
+    "iopoll": false
+  },
+  "buffers": { "buf_size": 8192, "buf_count": 64 },
+  "timeouts_ms": {
+    "cli_read": 1000,
+    "up_conn": 1000,
+    "up_write": 1000,
+    "up_read": 1000,
+    "cli_write": 1000
+  },
+  "upstreams": [
+    { "name": "u", "addr": "127.0.0.1:19080", "idle_ttl_ms": 1000 }
+  ],
+  "plugins": [],
+  "routes": [
+    { "path": "/", "upstream": "u" }
+  ]
+}"#;
+
+        let cfg: ConfigFile = serde_json::from_str(raw).expect("parse config");
+        assert_eq!(cfg.io_uring.entries, 1024);
+        assert_eq!(cfg.upstreams[0].keepalive, 32);
+
+        let compiled = compile_config(cfg, Arc::from(raw)).expect("compile config");
+        assert_eq!(compiled.upstreams[0].keepalive, 32);
     }
 
     #[test]

@@ -2,10 +2,6 @@ use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-/// Gossip runtime configuration parsed from `ConfigManager.current().raw_json`.
-///
-/// This is intentionally **decoupled** from `arc-config` schema to avoid requiring schema changes.
-/// Unknown fields remain harmless.
 #[derive(Debug, Clone)]
 pub struct GossipRuntimeConfig {
     pub gossip: GossipConfig,
@@ -24,10 +20,6 @@ impl Default for GossipRuntimeConfig {
 /// `cluster.fallback` section.
 #[derive(Debug, Clone)]
 pub struct GossipFallbackConfig {
-    /// When `true`, Arc keeps using legacy HTTP push/pull paths as fallback
-    /// if gossip is not running/usable.
-    ///
-    /// Default: `true`.
     pub http_push: bool,
 }
 
@@ -45,18 +37,8 @@ pub struct GossipConfig {
     /// Default: `false` (safer rollout).
     pub enabled: bool,
 
-    /// UDP/TCP bind address for gossip runtime (same port, different protocol).
-    ///
-    /// Unit: socket addr.
-    /// Default: `0.0.0.0:7946`.
     pub bind: SocketAddr,
 
-    /// Advertised address in gossip messages (NAT-friendly).
-    ///
-    /// Unit: socket addr.
-    /// Default: derived from `bind`:
-    /// - if `bind.ip()` is unspecified => `127.0.0.1:<port>`
-    /// - else => `bind`
     pub advertise: SocketAddr,
 
     /// Seed peers used to join the cluster on startup.
@@ -64,45 +46,16 @@ pub struct GossipConfig {
     /// Default: empty.
     pub peers: Vec<SocketAddr>,
 
-    /// Gossip / SWIM tick interval.
-    ///
-    /// Unit: duration.
-    /// Default: 200ms.
-    /// Range: [20ms .. 10s] (clamped).
     pub interval: Duration,
 
-    /// Fanout per gossip round.
-    ///
-    /// Default: 3.
-    /// Range: [1 .. 64] (clamped).
     pub fanout: usize,
 
-    /// How long a suspect can remain suspect before being marked dead.
-    ///
-    /// Unit: duration.
-    /// Default: 5s.
-    /// Range: [200ms .. 5min] (clamped).
     pub suspicion_timeout: Duration,
 
-    /// How long a dead member is kept before removal.
-    ///
-    /// Unit: duration.
-    /// Default: 30s.
-    /// Range: [1s .. 30min] (clamped).
     pub dead_timeout: Duration,
 
-    /// Max UDP datagram size (bytes). MTU-friendly.
-    ///
-    /// Default: 1400.
-    /// Range: [256 .. 65507] (clamped).
     pub max_message_size: usize,
 
-    /// Retransmit multiplier.
-    ///
-    /// Retransmit rounds ≈ `multiplier × ceil(log2(n))`.
-    ///
-    /// Default: 2.
-    /// Range: [1 .. 16] (clamped).
     pub retransmit_multiplier: usize,
 }
 

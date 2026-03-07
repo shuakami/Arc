@@ -42,10 +42,6 @@ pub struct GossipStatsView {
     pub members_dead: usize,
 }
 
-/// Gossip bus (SWIM membership + gossip dissemination + TCP full sync).
-///
-/// This runs on Arc's dedicated control-plane Tokio runtime threadpool.
-/// It must never block io_uring worker threads.
 pub struct GossipBus {
     mgr: ConfigManager,
     cluster_circuit: Arc<ClusterCircuit>,
@@ -270,10 +266,6 @@ impl GossipBus {
         self.runtime.load().fallback.http_push
     }
 
-    /// Notify the bus that a local config generation has been applied.
-    ///
-    /// This enqueues a config rumor immediately (best-effort), so control-plane changes
-    /// propagate without waiting for the next poll cycle.
     pub fn notify_local_config_applied(&self, generation: u64) {
         if !self.is_running() {
             return;

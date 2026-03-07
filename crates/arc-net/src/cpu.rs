@@ -1,8 +1,3 @@
-//! CPU affinity helpers (Linux).
-//!
-//! 边界：
-//! - 只在 worker init 路径使用；失败应为 warn，不影响功能。
-
 use std::io;
 use std::mem;
 

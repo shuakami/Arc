@@ -15,7 +15,7 @@ mod tls;
 mod worker;
 
 use arc_common::{ArcError, Result};
-use arc_config::{ConfigManager, GlobalRateLimitBackend, SharedConfig};
+use arc_config::{ConfigManager, ControlRole, GlobalRateLimitBackend, SharedConfig};
 use arc_global_rate_limit::{
     redis_backend::RedisLuaBackend, GlobalRateLimiter, GlobalRateLimiterConfig, InMemoryBackend,
     RateLimiterBackend, WorkerLimiter as GlobalWorkerLimiter,
@@ -112,8 +112,12 @@ fn real_main() -> Result<()> {
     let bootstrap_cfg = swap.load();
     let cp_cfg = bootstrap_cfg.control_plane.clone();
     let cc_cfg = bootstrap_cfg.cluster_circuit.clone();
+    let cluster_mode_configured = cp_cfg.enabled
+        && (!cp_cfg.peers.is_empty()
+            || !matches!(cp_cfg.role, ControlRole::Standalone)
+            || cp_cfg.pull_from.is_some());
     let mut circuit_cfg = ClusterCircuitConfig::default();
-    circuit_cfg.enabled = true;
+    circuit_cfg.enabled = cluster_mode_configured;
     circuit_cfg.fail_streak_threshold = cc_cfg.failure_threshold.max(1);
     circuit_cfg.open_ms = cc_cfg.circuit_open_ms.max(1);
     circuit_cfg.half_open_probe_interval_ms = cc_cfg.half_open_probe_interval_ms.max(1);
@@ -121,7 +125,9 @@ fn real_main() -> Result<()> {
     circuit_cfg.peer_ttl_ms = cp_cfg.peer_timeout_ms.saturating_mul(4).max(1_000);
     circuit_cfg.peer_open_quorum = cc_cfg.quorum.max(1);
     let cluster_circuit = Arc::new(ClusterCircuit::new(cp_cfg.node_id.clone(), circuit_cfg));
-    spawn_active_upstream_health_checker(mgr.clone(), cluster_circuit.clone())?;
+    if cluster_mode_configured {
+        spawn_active_upstream_health_checker(mgr.clone(), cluster_circuit.clone())?;
+    }
 
     control::start_control_plane(mgr.clone(), cluster_circuit.clone())?;
 

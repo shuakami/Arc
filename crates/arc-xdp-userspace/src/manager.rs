@@ -1,16 +1,3 @@
-//! XdpManager: Arc 主程序的 XDP 集成入口。
-//!
-//! 负责：
-//! - 启动时调用 arc-xdp 加载器（driver/generic 降级）
-//! - 打开并持有所有 pinned map fd
-//! - 启动后台任务：ringbuf consumer / stats collector / threshold calculator
-//! - 提供 black/whitelist 操作给控制面 API/CLI
-//! - 优雅关闭时 detach XDP（best-effort）
-//!
-//! 说明：
-//! - 这里的 “加载器” 通过外部命令调用（Command），因为你明确说 kernel 侧已由其它工程师实现完毕。
-//! - 如果加载器不存在/失败 => XDP Disabled 模式，Arc 继续运行（L7 兜底）。
-
 use crate::bpf;
 use crate::config::{parse_security_config_best_effort, ArcSecurityConfig, XdpUserConfig};
 use arc_common::{ArcError, Result};
@@ -64,11 +51,6 @@ impl fmt::Display for XdpMode {
     }
 }
 
-/// A handle to notify L7 rate limit module asynchronously.
-///
-/// 设计：
-/// - RingBufferConsumer 绝不 await；只 try_send。
-/// - L7 模块可在独立 task 中 drain 并执行实际封禁/倍率调整。
 #[derive(Clone)]
 pub struct L7LinkHandle {
     tx: mpsc::Sender<L7LinkMsg>,
@@ -337,10 +319,6 @@ impl XdpManagerState {
     }
 }
 
-/// Global singleton (optional) for control-plane/CLI integration without threading state through Arc.
-///
-/// 说明：
-/// - Arc 当前 control plane state struct 未包含 xdp manager；为了避免侵入，我们提供 OnceLock。
 static GLOBAL_XDP_MANAGER: OnceLock<Arc<XdpManager>> = OnceLock::new();
 
 /// Get global XdpManager (if initialized).
@@ -377,12 +355,6 @@ pub struct XdpManager {
     trace: TraceBuffer,
 }
 
-/// In-memory trace ring for recent decisions (bounded, lock-free-ish).
-///
-/// 设计：
-/// - 固定 slots（默认 8192）
-/// - 写入：atomic idx fetch_add + seqlock
-/// - 读取：遍历 slots 做一致性检查
 struct TraceBuffer {
     slots: Vec<TraceSlot>,
     mask: u64,
@@ -476,10 +448,6 @@ impl TraceBuffer {
 }
 
 impl XdpManager {
-    /// Spawn XDP integration manager.
-    ///
-    /// - `swap`: ArcSwap<SharedConfig> from arc-config
-    /// - `l7_link`: async notification link to L7 limiter (non-blocking for ring consumer)
     pub fn spawn(
         swap: Arc<arc_swap::ArcSwap<SharedConfig>>,
         l7_link: L7LinkHandle,
@@ -1463,12 +1431,6 @@ fn auto_detect_iface() -> Option<String> {
     None
 }
 
-/// Attach via external loader (driver->generic downgrade).
-///
-/// Assumption:
-/// - loader binary name: `arc-xdp-loader`
-/// - supports: `arc-xdp-loader attach --iface <iface> --mode driver|generic`
-/// - exit success => attached
 fn attach_via_loader(iface: &str, pin_base: &str) -> Result<XdpMode> {
     let loader = resolve_loader_bin("arc-xdp-loader", "ARC_XDP_LOADER");
     // Try driver first
@@ -1515,13 +1477,6 @@ fn attach_via_loader(iface: &str, pin_base: &str) -> Result<XdpMode> {
     }
 }
 
-/// Attach tc eBPF fallback.
-///
-/// Preferred command:
-/// - `arc-tc-loader attach --iface <iface>`
-///
-/// Compatibility fallback:
-/// - `arc-xdp-loader attach --iface <iface> --mode tc`
 fn attach_tc_via_loader(iface: &str, pin_base: &str) -> Result<()> {
     let tc_loader = resolve_loader_bin("arc-tc-loader", "ARC_TC_LOADER");
     let st = Command::new(&tc_loader)
@@ -1622,16 +1577,6 @@ fn has_linux_cap(cap: u32) -> bool {
     (bits & (1u128 << cap)) != 0
 }
 
-/// Open pinned maps under `pin_base` (default: `/sys/fs/bpf/arc`).
-///
-/// Map path assumptions:
-/// - {pin_base}/blacklist
-/// - {pin_base}/whitelist
-/// - {pin_base}/config
-/// - {pin_base}/global_stats
-/// - {pin_base}/port_stats
-/// - {pin_base}/syn_state
-/// - {pin_base}/events
 fn open_maps(pin_base: &str) -> Result<XdpMaps> {
     let bl_path = map_path(pin_base, "blacklist");
     let wl_path = map_path(pin_base, "whitelist");
@@ -1715,12 +1660,6 @@ fn open_optional_map(path: &str) -> (RawFd, Option<bpf::BpfMapInfo>) {
     }
 }
 
-/// Build a BlacklistEntry.
-///
-/// Layout is defined in arc-xdp-common:
-/// - reason
-/// - blocked_at_ns (monotonic-ish timestamp)
-/// - ttl_ns (0 means no-expire)
 fn make_blacklist_entry(ttl: Duration, reason: BlockReason) -> BlacklistEntry {
     BlacklistEntry {
         reason,
@@ -1757,20 +1696,10 @@ fn apply_dynamic_threshold(_c: &mut XdpConfig, _thr_pps: u64) {
     // same reason as above
 }
 
-/// Extract current SYN bucket from GlobalStats.
-///
-/// ASSUMPTION: GlobalStats contains the per-second ring and an index.
-/// Since we do not know fields, we fallback to 0.
 fn extract_current_syn_bucket(_gs: &GlobalStats) -> u64 {
     0
 }
 
-/// Classify XdpEvent into stable class without depending on enum fields.
-///
-/// 由于 arc-xdp-common 的 XdpEvent 枚举字段未提供，这里只能做最保守处理：
-/// - 返回 Unknown，让上层至少不 panic。
-///
-/// 一旦 arc-xdp-common 在仓库中可见，应将此函数替换为精确 match。
 enum EventClass {
     IpBlocked {
         ip: IpKey,

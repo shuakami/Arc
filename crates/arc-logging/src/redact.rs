@@ -3,11 +3,6 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashSet;
 
-/// Redaction rules (runtime).
-///
-/// - headers: case-insensitive
-/// - query params: case-insensitive
-/// - body_fields: limited JSONPath subset, only `$.a.b.c` (objects only), no arrays
 #[derive(Debug, Clone)]
 pub struct RedactionRules {
     headers_lc: HashSet<String>,
@@ -57,10 +52,6 @@ impl RedactionRules {
         }
     }
 
-    /// Redact query string (e.g. "a=1&token=xxx") by replacing matched key values with `[REDACTED]`.
-    ///
-    /// This function does NOT URL-decode and does NOT re-encode; it operates on raw query text,
-    /// which is consistent with "do not do extra parsing work".
     pub fn redact_query<'a>(&self, query: &'a str) -> Cow<'a, str> {
         if query.is_empty() || self.query_lc.is_empty() {
             return Cow::Borrowed(query);
@@ -108,12 +99,6 @@ impl RedactionRules {
         Cow::Owned(out)
     }
 
-    /// Redact a parsed JSON body in place.
-    ///
-    /// Only executes if caller already parsed JSON body (per spec).
-    /// Redaction replaces value with string `[REDACTED]` instead of deleting field.
-    ///
-    /// 当前 access 日志尚未记录请求体，这个接口保留给后续 body 日志接入使用。
     #[allow(dead_code)]
     pub fn redact_body_json(&self, body: &mut Value) {
         if self.body_paths.is_empty() {

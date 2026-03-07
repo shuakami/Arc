@@ -1,8 +1,3 @@
-//! Arc Daemon
-//!
-//! Data plane: Pingora (HTTP/1.1 + HTTP/2 + TLS)
-//! Control plane: node-local API (axum)
-
 use arc_core::{
     compiled::{CompiledConfig, SharedConfig},
     config::{load_from_path, ArcConfig, ListenerKind},

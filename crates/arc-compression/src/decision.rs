@@ -1,14 +1,3 @@
-//! Compression decision logic.
-//!
-//! Spec mapping:
-//! - min_size gate (Content-Length only)
-//! - MIME filter
-//! - already-compressed detection (Content-Encoding + magic bytes)
-//! - Accept-Encoding negotiation (RFC 7231)
-//! - size bucket -> base level
-//! - adaptive controller applies per-algorithm offsets (no algorithm switch)
-//! - per-route overrides (enabled/algorithm/level/min_size/flush_per_event)
-
 use crate::accept::negotiate_encoding;
 use crate::magic::is_known_compressed_magic;
 use crate::mime::MimeMatcher;
@@ -147,13 +136,6 @@ pub struct CompressionPlan {
     pub flush_per_event: bool,
 }
 
-/// Decide whether and how to compress a response.
-///
-/// `body_prefix`:
-/// - Optional first <=8 bytes of decoded payload (not chunked framing).
-/// - Used for magic bytes detection when Content-Encoding is missing/identity.
-///
-/// This function is designed to be allocation-free on hot path (except when `algorithms` Vec is in config).
 #[inline]
 pub fn decide_response_compression(
     global: &GlobalCompressionConfig,

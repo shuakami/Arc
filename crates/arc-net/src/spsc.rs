@@ -1,14 +1,3 @@
-//! Lock-free SPSC queue.
-//!
-//! 这个模块是什么：
-//! - 单生产者/单消费者队列，用于跨线程消息传递（无锁、无 Mutex）。
-//!
-//! 不是什么：
-//! - 不支持 MPSC/MPMC。
-//!
-//! 说明：
-//! - `new()` 中对 N 的断言只发生在 init 路径；N 是 const 泛型，生产环境应固定为合法值。
-
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};

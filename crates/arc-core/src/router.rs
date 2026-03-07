@@ -60,13 +60,6 @@ pub struct MatchedRoute {
     pub params: AHashMap<Arc<str>, Arc<str>>,
 }
 
-/// Router is a multi-dimensional, radix-backed matcher.
-///
-/// Fast path:
-/// 1) host => HostRouter (exact hash; wildcard suffix longest-match)
-/// 2) method => MethodRouter (hash)
-/// 3) path => radix tree match (matchit)
-/// 4) evaluate predicates (compiled)
 #[derive(Debug)]
 pub struct Router {
     default: HostRouter,

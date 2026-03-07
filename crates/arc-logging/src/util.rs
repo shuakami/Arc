@@ -1,9 +1,5 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// Current unix timestamp in nanoseconds.
-///
-/// Never panics. If system time is before UNIX_EPOCH (shouldn't happen in prod),
-/// returns 0.
 pub fn now_unix_ns() -> u64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(d) => d
@@ -45,14 +41,6 @@ pub fn clamp_u64(val: u64, min: u64, max: u64) -> u64 {
     }
 }
 
-/// Parse a human duration used by config/control plane.
-///
-/// Supported:
-/// - "0" => 0ms
-/// - "<n>ms", "<n>s", "<n>m", "<n>h"
-/// - plain integer => milliseconds
-///
-/// Returns `None` on parse error.
 pub fn parse_duration_millis(s: &str) -> Option<u64> {
     let ss = s.trim();
     if ss.is_empty() {
@@ -83,13 +71,6 @@ pub fn parse_duration_millis(s: &str) -> Option<u64> {
     ss.parse::<u64>().ok()
 }
 
-/// Parse size string used by rotation.max_size.
-///
-/// Supported:
-/// - numeric => bytes
-/// - "<n>KB", "<n>MB", "<n>GB" (case-insensitive)
-///
-/// Returns `None` on parse error.
 pub fn parse_size_bytes(s: &str) -> Option<u64> {
     let ss = s.trim();
     if ss.is_empty() {

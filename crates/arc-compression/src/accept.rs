@@ -1,16 +1,3 @@
-//! Accept-Encoding negotiation (RFC 7231 compatible enough for Arc).
-//!
-//! Spec mapping:
-//! 1) Parse Accept-Encoding tokens + q
-//! 2) Intersect with Arc supported algorithms
-//! 3) Choose by q; tie-break: zstd > br > gzip > identity
-//! 4) If client doesn't support any => identity
-//!
-//! Notes:
-//! - If Accept-Encoding is missing: treat as no compression (identity), safe default.
-//! - If "*" is present: it applies to algorithms not explicitly listed.
-//! - identity defaults to q=1.0 unless explicitly set or covered by "*;q=0".
-
 use crate::util::{eq_ascii_case, trim_ascii_http_ws};
 use crate::Algorithm;
 
@@ -23,13 +10,6 @@ pub struct NegotiatedEncoding {
     pub q_millis: u16,
 }
 
-/// Negotiate `Accept-Encoding` against a supported list.
-///
-/// `accept`:
-/// - None => identity
-/// - Some(empty/whitespace) => identity
-///
-/// `supported` is a slice of algorithms Arc is willing to emit for this request (after config/per-route).
 #[inline]
 pub fn negotiate_encoding(accept: Option<&[u8]>, supported: &[Algorithm]) -> NegotiatedEncoding {
     let Some(raw) = accept else {

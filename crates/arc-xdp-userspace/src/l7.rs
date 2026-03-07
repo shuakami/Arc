@@ -1,13 +1,3 @@
-//! L7Protection implementation (slowloris / TLS flood / HTTP2 stream flood).
-//!
-//! 目标：
-//! - 数据结构尽可能轻量，避免锁。
-//! - 对“per-IP”类限制使用 bucket-hash（可能误伤但极低开销，适合作为防护）。
-//!
-//! 注意：
-//! - 这里是通用组件；真正“断开连接 / 发送 TLS alert / GOAWAY” 需要 Arc worker 调用方做 I/O 动作。
-//! - 这里仅返回决策（Allow/Drop/GoAway 等）+ 统计计数器。
-
 use crate::config::L7ProtectionConfig;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -16,16 +6,12 @@ use std::time::Duration;
 #[derive(Debug, Default)]
 pub struct L7Metrics {
     pub slowloris_dropped_total: AtomicU64,
-    pub tls_flood_dropped_total: AtomicU64,
-    pub h2_stream_flood_dropped_total: AtomicU64,
 }
 
 /// L7Protection top-level object.
 #[derive(Debug)]
 pub struct L7Protection {
     pub slowloris: SlowlorisGuard,
-    pub tls_flood: TlsFloodGuard,
-    pub h2_stream_flood: H2StreamFloodGuard,
     pub metrics: L7Metrics,
 }
 
@@ -34,8 +20,6 @@ impl L7Protection {
     pub fn new(cfg: &L7ProtectionConfig) -> Self {
         Self {
             slowloris: SlowlorisGuard::new(cfg),
-            tls_flood: TlsFloodGuard::new(cfg),
-            h2_stream_flood: H2StreamFloodGuard::new(cfg),
             metrics: L7Metrics::default(),
         }
     }
@@ -59,12 +43,6 @@ pub struct SlowlorisConnState {
     pub bytes_in_headers: u64,
 }
 
-/// Bucketed per-IP counter (approximate; collisions possible).
-///
-/// 设计：
-/// - 固定大小 power-of-two bucket array
-/// - key => bucket idx
-/// - inc/dec 只做 atomic_fetch
 #[derive(Debug)]
 struct IpBucketCounter {
     mask: u64,
@@ -130,11 +108,6 @@ impl IpBucketCounter {
     }
 }
 
-/// Slowloris guard.
-///
-/// 需要调用方提供：
-/// - now_ns（monotonic）
-/// - ip_key_hash（u64 stable hash of client identity, e.g. hashed IpKey）
 #[derive(Debug)]
 pub struct SlowlorisGuard {
     enabled: bool,
@@ -194,10 +167,6 @@ impl SlowlorisGuard {
         }
     }
 
-    /// Called on receiving header bytes.
-    ///
-    /// - `state` is stored in conn struct
-    /// - `added` is bytes just read that belong to headers
     #[inline]
     pub fn on_header_bytes(
         &self,
@@ -234,204 +203,6 @@ impl SlowlorisGuard {
     #[inline]
     pub fn headers_timeout_ns(&self) -> u64 {
         self.headers_timeout_ns
-    }
-}
-
-/// TLS flood decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TlsFloodDecision {
-    Allow,
-    DropRateLimited,
-}
-
-/// TLS handshake rate guard.
-///
-/// 注意：
-/// - 这里按 “每秒窗口计数” 实现，开销极低；指数衰减可由上层 periodic 衰减/平滑。
-// - 你要求“指数衰减与 XDP SYN score 一致”，但未给具体参数/公式；这里采用窗口计数实现，
-///   并提供 hook（tick）用于上层做指数衰减扩展。
-#[derive(Debug)]
-pub struct TlsFloodGuard {
-    enabled: bool,
-    max_per_sec: u32,
-
-    // bucketed per-IP window counter
-    buckets: Vec<AtomicU64>, // packed: (sec << 32) | count
-    mask: u64,
-}
-
-impl TlsFloodGuard {
-    pub fn new(cfg: &L7ProtectionConfig) -> Self {
-        let c = &cfg.tls_flood;
-        let n = 262_144usize;
-        let mut v = Vec::with_capacity(n);
-        for _ in 0..n {
-            v.push(AtomicU64::new(0));
-        }
-        Self {
-            enabled: c.enabled,
-            max_per_sec: c.max_handshakes_per_ip_per_sec.max(1),
-            buckets: v,
-            mask: (n as u64).saturating_sub(1),
-        }
-    }
-
-    #[inline]
-    fn idx(&self, ip_key_hash: u64) -> usize {
-        // same mixer as slowloris
-        let mut x = ip_key_hash.wrapping_add(0x9E3779B97F4A7C15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
-        ((x ^ (x >> 31)) & self.mask) as usize
-    }
-
-    /// Called on handshake attempt.
-    ///
-    /// `now_sec` should be epoch seconds or monotonic seconds; only relative equality matters.
-    #[inline]
-    pub fn on_handshake(&self, ip_key_hash: u64, now_sec: u32) -> TlsFloodDecision {
-        if !self.enabled {
-            return TlsFloodDecision::Allow;
-        }
-
-        let i = self.idx(ip_key_hash);
-        let cell = &self.buckets[i];
-
-        loop {
-            let cur = cell.load(Ordering::Relaxed);
-            let sec = (cur >> 32) as u32;
-            let cnt = (cur & 0xFFFF_FFFF) as u32;
-
-            if sec != now_sec {
-                let next = ((now_sec as u64) << 32) | 1u64;
-                match cell.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
-                    Ok(_) => {
-                        return if 1 > self.max_per_sec {
-                            TlsFloodDecision::DropRateLimited
-                        } else {
-                            TlsFloodDecision::Allow
-                        }
-                    }
-                    Err(_) => continue,
-                }
-            } else {
-                let next_cnt = cnt.saturating_add(1);
-                let next = ((sec as u64) << 32) | (next_cnt as u64);
-                match cell.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
-                    Ok(_) => {
-                        if next_cnt > self.max_per_sec {
-                            return TlsFloodDecision::DropRateLimited;
-                        }
-                        return TlsFloodDecision::Allow;
-                    }
-                    Err(_) => continue,
-                }
-            }
-        }
-    }
-}
-
-/// H2 stream flood decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum H2Decision {
-    Allow,
-    GoAway,
-}
-
-/// Per-connection H2 state (store in conn struct).
-#[derive(Debug, Clone, Copy)]
-pub struct H2ConnState {
-    pub open_streams: u32,
-    pub window_sec: u32,
-    pub streams_created_in_window: u32,
-    pub rsts_in_window: u32,
-}
-
-/// HTTP/2 stream flood guard.
-#[derive(Debug)]
-pub struct H2StreamFloodGuard {
-    enabled: bool,
-    max_concurrent_streams: u32,
-    max_streams_per_sec: u32,
-    max_rst_per_sec: u32,
-}
-
-impl H2StreamFloodGuard {
-    pub fn new(cfg: &L7ProtectionConfig) -> Self {
-        let c = &cfg.h2_stream_flood;
-        Self {
-            enabled: c.enabled,
-            max_concurrent_streams: c.max_concurrent_streams.max(1),
-            max_streams_per_sec: c.max_streams_per_sec.max(1),
-            max_rst_per_sec: c.max_rst_per_sec.max(1),
-        }
-    }
-
-    #[inline]
-    pub fn init_conn_state(&self, now_sec: u32) -> H2ConnState {
-        H2ConnState {
-            open_streams: 0,
-            window_sec: now_sec,
-            streams_created_in_window: 0,
-            rsts_in_window: 0,
-        }
-    }
-
-    #[inline]
-    fn rotate_window_if_needed(&self, st: &mut H2ConnState, now_sec: u32) {
-        if st.window_sec != now_sec {
-            st.window_sec = now_sec;
-            st.streams_created_in_window = 0;
-            st.rsts_in_window = 0;
-        }
-    }
-
-    /// Called on new inbound stream.
-    #[inline]
-    pub fn on_stream_open(&self, st: &mut H2ConnState, now_sec: u32) -> H2Decision {
-        if !self.enabled {
-            st.open_streams = st.open_streams.saturating_add(1);
-            return H2Decision::Allow;
-        }
-
-        self.rotate_window_if_needed(st, now_sec);
-
-        st.open_streams = st.open_streams.saturating_add(1);
-        st.streams_created_in_window = st.streams_created_in_window.saturating_add(1);
-
-        if st.open_streams > self.max_concurrent_streams {
-            return H2Decision::GoAway;
-        }
-        if st.streams_created_in_window > self.max_streams_per_sec {
-            return H2Decision::GoAway;
-        }
-
-        H2Decision::Allow
-    }
-
-    /// Called when a stream is closed.
-    #[inline]
-    pub fn on_stream_close(&self, st: &mut H2ConnState) {
-        if st.open_streams > 0 {
-            st.open_streams -= 1;
-        }
-    }
-
-    /// Called on receiving RST_STREAM.
-    #[inline]
-    pub fn on_rst_stream(&self, st: &mut H2ConnState, now_sec: u32) -> H2Decision {
-        if !self.enabled {
-            return H2Decision::Allow;
-        }
-
-        self.rotate_window_if_needed(st, now_sec);
-
-        st.rsts_in_window = st.rsts_in_window.saturating_add(1);
-        if st.rsts_in_window > self.max_rst_per_sec {
-            return H2Decision::GoAway;
-        }
-
-        H2Decision::Allow
     }
 }
 
@@ -493,43 +264,6 @@ mod tests {
             g.on_header_bytes(500_000_000, &mut st3, 100),
             SlowlorisDecision::Allow
         );
-    }
-
-    #[test]
-    fn tls_flood_guard_rate_limits_per_second_window() {
-        let mut c = cfg();
-        c.tls_flood.enabled = true;
-        c.tls_flood.max_handshakes_per_ip_per_sec = 2;
-        let g = TlsFloodGuard::new(&c);
-        let ip = 100u64;
-
-        assert_eq!(g.on_handshake(ip, 10), TlsFloodDecision::Allow);
-        assert_eq!(g.on_handshake(ip, 10), TlsFloodDecision::Allow);
-        assert_eq!(g.on_handshake(ip, 10), TlsFloodDecision::DropRateLimited);
-        // next second rotates the window
-        assert_eq!(g.on_handshake(ip, 11), TlsFloodDecision::Allow);
-    }
-
-    #[test]
-    fn h2_guard_limits_stream_and_rst_bursts() {
-        let mut c = cfg();
-        c.h2_stream_flood.enabled = true;
-        c.h2_stream_flood.max_concurrent_streams = 2;
-        c.h2_stream_flood.max_streams_per_sec = 2;
-        c.h2_stream_flood.max_rst_per_sec = 1;
-        let g = H2StreamFloodGuard::new(&c);
-
-        let mut st = g.init_conn_state(100);
-        assert_eq!(g.on_stream_open(&mut st, 100), H2Decision::Allow);
-        assert_eq!(g.on_stream_open(&mut st, 100), H2Decision::Allow);
-        assert_eq!(g.on_stream_open(&mut st, 100), H2Decision::GoAway);
-
-        g.on_stream_close(&mut st);
-        g.on_stream_close(&mut st);
-        assert_eq!(g.on_stream_open(&mut st, 101), H2Decision::Allow);
-
-        assert_eq!(g.on_rst_stream(&mut st, 101), H2Decision::Allow);
-        assert_eq!(g.on_rst_stream(&mut st, 101), H2Decision::GoAway);
     }
 
     #[test]

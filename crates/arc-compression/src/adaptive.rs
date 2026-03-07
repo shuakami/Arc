@@ -1,16 +1,3 @@
-//! Adaptive compression level controller.
-//!
-//! Spec mapping:
-//! - 3-state machine: Normal / Degraded / Enhanced
-//! - CPU > high_threshold持续 check_interval => Degraded (level - 1)
-//! - CPU < low_threshold持续 check_interval  => Enhanced (level + 1)
-//! - Enter Degraded/Enhanced => cooldown；冷却期不再调整
-//! - cooldown结束 => 回到 Normal 重新评估
-//! - 只在同算法内调整，不跨算法切换
-//! - 只影响新请求，不影响正在压缩中的响应
-//!
-//! 这个模块 **不创建线程**；数据面可以在已有 tick 或 metrics 刷新点调用 `maybe_adjust`。
-
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
@@ -153,12 +140,6 @@ impl AdaptiveController {
         }
     }
 
-    /// Apply the current offset to `base_level` and clamp to algorithm-allowed range.
-    ///
-    /// Allowed ranges (real-time safe defaults):
-    /// - zstd: 1..=5
-    /// - gzip: 1..=9
-    /// - br:   4..=6
     #[inline]
     pub fn apply_level(&self, alg: Algorithm, base_level: i32) -> i32 {
         let off = self.level_offset(alg);
@@ -171,17 +152,6 @@ impl AdaptiveController {
         }
     }
 
-    /// The "current level" used for metrics gauge.
-    ///
-    /// Spec says: `arc_compression_level_current{algorithm}` should expose the **effective level**
-    /// after adaptive adjustments.
-    ///
-    /// Arc 有多个 size bucket 的 base level；这里选用 1KB-100KB 桶的 base level 作为 gauge 基准：
-    /// - zstd base=3
-    /// - gzip base=6
-    /// - br   base=5
-    ///
-    /// 调用方（arc-gateway）可直接用此返回值写 metrics gauge。
     #[inline]
     pub fn current_level_for_gauge(&self, alg: Algorithm) -> i32 {
         let base = match alg {
@@ -193,12 +163,6 @@ impl AdaptiveController {
         self.apply_level(alg, base)
     }
 
-    /// Feed a CPU usage sample and maybe adjust level offsets.
-    ///
-    /// - `now_ns`: monotonic timestamp
-    /// - `cpu`: CPU utilization in [0.0, 1.0] (caller must clamp)
-    ///
-    /// Returns `Some(AdaptiveAdjustment)` only when an actual adjustment happens.
     pub fn maybe_adjust(&self, now_ns: u64, mut cpu: f64) -> Option<AdaptiveAdjustment> {
         if !self.cfg.enabled {
             return None;

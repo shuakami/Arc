@@ -1,23 +1,3 @@
-//! ZeroCopyResponder
-//!
-//! 目标：
-//! - 对调用方透明：根据 body 大小自动选择普通发送或 MSG_ZEROCOPY。
-//!
-//! 注意：
-//! - 你要求 “io_uring + MSG_ZEROCOPY”。Arc 当前热路径写出使用的是 io_uring write_fixed。
-//!   MSG_ZEROCOPY 需要 sendmsg/send/IORING_OP_SEND_ZC 才能生效。
-//! - 在没有改动 Arc worker 的前提下，这里先提供：
-//!   1) socket option 配置函数（SO_ZEROCOPY）
-//!   2) 同步 sendmsg(MSG_ZEROCOPY) 发送路径（可供未来 worker 引入 IORING_OP_SENDMSG/ SEND_ZC 替换）
-//!
-//! 这份实现不包含 “error queue” 的完整确认回收逻辑（那需要 worker 持续 drain MSG_ERRQUEUE）。
-//! 但对于大包响应，依然可以显著减少拷贝开销。
-//!
-//! 生产建议：
-//! - 在 Arc worker 中为 client socket 打开 SO_ZEROCOPY
-//! - 对 > threshold 的响应使用 io_uring sendmsg 或 IORING_OP_SEND_ZC，并处理 completion 与 errqueue
-//! - 对 <= threshold 继续 write_fixed
-
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;
@@ -51,11 +31,6 @@ impl ZeroCopyResponder {
         body_len > self.threshold
     }
 
-    /// Enable SO_ZEROCOPY on a TCP socket (best-effort).
-    ///
-    /// Linux: setsockopt(SOL_SOCKET, SO_ZEROCOPY, 1)
-    ///
-    /// 注意：并非所有内核/驱动支持；失败应为 warn，不影响功能。
     pub fn enable_socket_zerocopy(fd: RawFd) -> io::Result<()> {
         let val: libc::c_int = 1;
         let rc = unsafe {

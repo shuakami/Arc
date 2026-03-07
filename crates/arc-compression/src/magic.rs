@@ -1,14 +1,3 @@
-//! Magic-bytes based "already compressed" detection.
-//!
-//! Spec mapping:
-//! - gzip: 1f 8b
-//! - zstd: 28 b5 2f fd
-//! - PNG: 89 50 4e 47
-//! - JPEG: ff d8 ff
-//! - ZIP/jar/docx: 50 4b 03 04
-//!
-//! Brotli has no stable magic bytes => not detected here.
-
 /// Return true if `prefix` (up to 8 bytes) matches a known already-compressed format.
 #[inline]
 pub fn is_known_compressed_magic(prefix: &[u8]) -> bool {

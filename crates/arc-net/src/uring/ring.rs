@@ -1,18 +1,3 @@
-//! Minimal io_uring ring implementation (no liburing dependency).
-//!
-//! Safety notes:
-//! - mmap 区域指针与 ring lifetime 绑定；Drop 中 munmap。
-//! - SQ/CQ 原子 head/tail 读写需使用正确内存序：
-//!   - 读取 head/tail：Acquire
-//!   - 提交 tail：Release
-//! - 提供的 fixed buffers/files 注册由内核持有引用，调用方必须保证底层数组在 register 调用期间有效。
-//!
-//! 这个模块不是什么：
-//! - 不实现高级 helper（buffer selection ring 等）。
-//!
-//! 设计目标：
-//! - 清晰、可控、零依赖，满足数据面 zero-error 与可观测性。
-
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;

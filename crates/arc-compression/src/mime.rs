@@ -1,21 +1,3 @@
-//! MIME type filtering for response compression.
-//!
-//! Default include (compressible):
-//! - text/*
-//! - application/json
-//! - application/xml
-//! - application/javascript
-//! - application/wasm
-//! - image/svg+xml
-//!
-//! Default exclude (skip):
-//! - image/jpeg, image/png, image/gif, image/webp
-//! - audio/*, video/*
-//! - application/zip, application/gzip, application/x-tar
-//! - application/octet-stream
-//!
-//! User config can append include/exclude lists (exclude wins on conflict).
-
 use crate::util::{content_type_token, eq_ascii_case, starts_with_ascii_case};
 
 /// MIME matcher used by the decision path.
@@ -54,10 +36,6 @@ impl MimeMatcher {
         }
     }
 
-    /// Whether this `Content-Type` should be compressed by default policy.
-    ///
-    /// - If `content_type` is None => treated as unknown binary => excluded.
-    /// - Exclude rules win over include rules.
     #[inline]
     pub fn should_compress(&self, content_type: Option<&[u8]>) -> bool {
         let Some(ct) = content_type else {
